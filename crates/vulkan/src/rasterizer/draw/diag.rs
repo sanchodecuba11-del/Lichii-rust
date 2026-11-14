@@ -226,7 +226,7 @@ impl DrawDiag {
 
     /// Writes `text` whatever the window, up to a fixed number of lines.
     pub(crate) fn always(&mut self, text: &str) {
-        if self.always < 20_000 {
+        if self.always < 60_000 {
             self.always += 1;
             let _ = writeln!(self.out, "{text} t={:.4}", now().as_secs_f64());
             let _ = self.out.flush();

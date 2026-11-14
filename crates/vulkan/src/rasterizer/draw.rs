@@ -790,9 +790,9 @@ impl VulkanRasterizer {
                 .iter()
                 .copied()
                 .filter(|&id| {
-                    self.texture_cache
-                        .state(id)
-                        .is_some_and(|s| s.info.width * s.info.height <= 4096)
+                    self.texture_cache.state(id).is_some_and(|s| {
+                        s.info.width * s.info.height <= if traced { 1 << 17 } else { 4096 }
+                    })
                 })
                 .collect();
             if !small.is_empty() {
