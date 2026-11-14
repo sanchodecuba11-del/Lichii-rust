@@ -223,6 +223,26 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 10,
     },
     Workload {
+        name: "simd convert loop",
+        code: &[
+            0x4f03f607, // fmov v7.4s, #1.0
+            0x4f00f488, // fmov v8.4s, #2.5
+            0x6e28fce0, // 1: fdiv v0.4s, v7.4s, v8.4s
+            0x6ea7d501, // fabd v1.4s, v8.4s, v7.4s
+            0x4ea1b822, // fcvtzs v2.4s, v1.4s
+            0x4f30fc03, // fcvtzs v3.4s, v0.4s, #16
+            0x6ea0b864, // neg v4.4s, v3.4s
+            0x0e612885, // xtn v5.4h, v4.4s
+            0x4eb1b846, // addv s6, v2.4s
+            0x4ea008c9, // rev64 v9.4s, v6.4s
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffec1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
+    },
+    Workload {
         name: "exclusive pair loop",
         code: &[
             0xc87f1823, // 1: ldxp x3, x6, [x1]
