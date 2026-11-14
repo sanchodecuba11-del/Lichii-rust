@@ -1445,6 +1445,9 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
+        if let Some(max_bytes) = draw::diag::flush_all() {
+            self.diag_flush_all(max_bytes);
+        }
         self.activity.presents += 1;
         let now = Instant::now();
         self.stalls

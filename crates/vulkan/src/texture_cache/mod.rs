@@ -1277,6 +1277,24 @@ impl TextureCache {
         result
     }
 
+    /// Diagnostic only: writes every GPU-modified image of at most max_bytes guest bytes back
+    /// to guest memory, and returns how many.
+    pub fn diag_flush_all(&mut self, tx: &mut Transfer<'_>, max_bytes: u64) -> Result<usize> {
+        let ids: Vec<ImageId> = (0..self.slots.len())
+            .filter_map(|index| {
+                let slot = &self.slots[index];
+                let image = slot.image.as_ref()?;
+                (image.gpu_modified && image.downloadable() && image.info.size_bytes() <= max_bytes)
+                    .then_some(ImageId {
+                        index: index as u32,
+                        generation: slot.generation,
+                    })
+            })
+            .collect();
+        self.download(tx, &ids, None)?;
+        Ok(ids.len())
+    }
+
     /// Diagnostic only: writes `id` back to guest memory when it is GPU-modified, and returns the
     /// guest spans it occupies.
     pub fn diag_download(

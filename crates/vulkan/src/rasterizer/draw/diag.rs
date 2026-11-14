@@ -158,6 +158,19 @@ pub(crate) fn watch_dev(kind: &str, daddr: u64, size: u64) {
     watch_hit(kind, daddr, size, true, "");
 }
 
+/// LICHII_DIAG_FLUSH_ALL=<bytes>: at every present, write GPU-modified images up to that
+/// many guest bytes, and every GPU-written buffer, back to guest memory.
+pub(crate) fn flush_all() -> Option<u64> {
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LICHII_DIAG_FLUSH_ALL")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
 pub(crate) fn state() -> Option<&'static Mutex<DrawDiag>> {
     static STATE: OnceLock<Option<Mutex<DrawDiag>>> = OnceLock::new();
     STATE
@@ -332,6 +345,28 @@ pub(crate) fn texel_stats(format: PixelFormat, bytes: &[u8]) -> String {
 }
 
 impl VulkanRasterizer {
+    /// Writes GPU-written buffers and small GPU-modified images back to guest memory.
+    pub(in crate::rasterizer) fn diag_flush_all(&mut self, max_bytes: u64) {
+        if let Err(error) = self.buffer_cache.flush(&mut self.scheduler, 0, u64::MAX) {
+            tracing::error!(%error, "diag flush of buffers failed");
+        }
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
+        };
+        match self.texture_cache.diag_flush_all(&mut tx, max_bytes) {
+            Ok(n) => {
+                static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 600 == 0 {
+                    tracing::warn!(images = n, max_bytes, "diag flush-all at present");
+                }
+            }
+            Err(error) => tracing::error!(%error, "diag flush of images failed"),
+        }
+    }
+
     /// Writes each image back to guest memory and logs its texel statistics as a STAT line.
     pub(in crate::rasterizer) fn diag_image_stats(&mut self, label: &str, ids: &[ImageId]) {
         for &id in ids {
