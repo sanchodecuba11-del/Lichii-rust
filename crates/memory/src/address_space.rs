@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{Ordering, fence};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use lichii_common::{PAGE_BITS, PAGE_MASK, PAGE_SIZE, PAddr, VAddr};
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -124,9 +124,31 @@ pub struct AddressSpace {
     trapped: PageFlags,
     dirty: DirtyPages,
     flush_sink: RwLock<Option<FlushSink>>,
+    trap_stats: TrapCounters,
     /// Calls that armed or disarmed flush traps under the lock.
     #[cfg(test)]
     pub(crate) trap_updates: std::sync::atomic::AtomicU64,
+}
+
+/// Flush trap work since the last [`DeviceAddressSpace::take_flush_trap_stats`](crate::DeviceAddressSpace::take_flush_trap_stats).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlushTrapStats {
+    /// Arm calls that trapped new pages.
+    pub arms: u64,
+    /// Disarm calls that untrapped pages.
+    pub disarms: u64,
+    /// Host protection changes those calls made to fastmem views.
+    pub protects: u64,
+    /// Accesses that met a flush trap.
+    pub traps: u64,
+}
+
+#[derive(Default)]
+struct TrapCounters {
+    arms: AtomicU64,
+    disarms: AtomicU64,
+    protects: AtomicU64,
+    traps: AtomicU64,
 }
 
 /// Write-tracking state that changes with the mappings.
@@ -156,6 +178,7 @@ impl AddressSpace {
             trapped: PageFlags::new(physical.size()),
             dirty: DirtyPages::new(physical.size()),
             flush_sink: RwLock::new(None),
+            trap_stats: TrapCounters::default(),
             #[cfg(test)]
             trap_updates: Default::default(),
             physical,
@@ -181,6 +204,7 @@ impl AddressSpace {
             trapped: PageFlags::new(physical.size()),
             dirty: DirtyPages::new(physical.size()),
             flush_sink: RwLock::new(None),
+            trap_stats: TrapCounters::default(),
             #[cfg(test)]
             trap_updates: Default::default(),
             physical,
@@ -393,12 +417,14 @@ impl AddressSpace {
     /// Brings the table flags and fastmem views of `pages` in line with the tracked and trapped
     /// flags of the physical pages they map, in runs: a tracked page's view is write-protected, a
     /// trapped page's view inaccessible. Called with `update` held.
-    fn sync_pages(&self, pages: &mut [VAddr]) {
+    fn sync_pages(&self, pages: &mut [VAddr]) -> u64 {
         type Run = (VAddr, u64, MemoryPermission, Option<HostProtection>);
         pages.sort_unstable();
         let mut run: Option<Run> = None;
-        let flush = |run: Option<Run>| {
+        let mut protects = 0;
+        let mut flush = |run: Option<Run>| {
             if let (Some((va, size, perm, cap)), Some(fastmem)) = (run, &self.fastmem) {
+                protects += 1;
                 fastmem
                     .arena
                     .restrict(va as usize, size as usize, perm.host(), cap)
@@ -424,6 +450,7 @@ impl AddressSpace {
             }
         }
         flush(run);
+        protects
     }
 
     /// Adds a cache hold to every physical page of `runs` and tracks every virtual page that maps
@@ -484,7 +511,7 @@ impl AddressSpace {
                 }
             }
         }
-        self.sync_pages(&mut pages);
+        self.count_trap_update(&self.trap_stats.arms, &mut pages);
     }
 
     /// Removes the flush traps of the physical pages of `runs`.
@@ -501,7 +528,28 @@ impl AddressSpace {
                 }
             }
         }
-        self.sync_pages(&mut pages);
+        self.count_trap_update(&self.trap_stats.disarms, &mut pages);
+    }
+
+    /// Brings `pages` in line with their trap flags and counts the change in `calls`.
+    fn count_trap_update(&self, calls: &AtomicU64, pages: &mut [VAddr]) {
+        calls.fetch_add(1, Ordering::Relaxed);
+        let protects = self.sync_pages(pages);
+        self.trap_stats
+            .protects
+            .fetch_add(protects, Ordering::Relaxed);
+    }
+
+    /// Takes the flush trap counts gathered since the last call.
+    pub(crate) fn take_trap_stats(&self) -> FlushTrapStats {
+        let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
+        let stats = &self.trap_stats;
+        FlushTrapStats {
+            arms: take(&stats.arms),
+            disarms: take(&stats.disarms),
+            protects: take(&stats.protects),
+            traps: take(&stats.traps),
+        }
     }
 
     /// Installs what a flush trap calls; without one a trap only removes itself.
@@ -526,6 +574,7 @@ impl AddressSpace {
         if !self.trapped.test(page) {
             return;
         }
+        self.trap_stats.traps.fetch_add(1, Ordering::Relaxed);
         let sink = self.flush_sink.read().clone();
         if !sink.is_some_and(|sink| sink(page)) {
             self.disarm_physical(&[(page, PAGE_SIZE)]);

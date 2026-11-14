@@ -1321,6 +1321,16 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
+    fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
+        if let Err(error) = self
+            .buffer_cache
+            .flush_for_cpu_read(&mut self.scheduler, addr, size)
+        {
+            tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
+        }
+        self.flush_region(addr, size);
+    }
+
     fn unmap_region(&mut self, addr: DAddr, size: u64) {
         self.buffer_cache.invalidate(addr, size);
         self.draw.shaders.invalidate(addr, size);

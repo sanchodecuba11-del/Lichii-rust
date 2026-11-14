@@ -21,6 +21,9 @@ pub struct DeviceAddressSpace {
     /// attached process's flush sink.
     update: Arc<Mutex<ReverseMap>>,
     process: OnceLock<Arc<AddressSpace>>,
+    /// The handler [`DeviceAddressSpace::set_flush_trap_handler`] installed, for a process
+    /// attached later; locked while either changes.
+    flush_handler: Mutex<Option<Arc<dyn FlushTrapHandler>>>,
 }
 
 impl DeviceAddressSpace {
@@ -31,6 +34,7 @@ impl DeviceAddressSpace {
             update: Arc::new(Mutex::new(ReverseMap::new(physical.size()))),
             physical,
             process: OnceLock::new(),
+            flush_handler: Mutex::new(None),
         }
     }
 
@@ -40,10 +44,12 @@ impl DeviceAddressSpace {
             Arc::ptr_eq(process.physical(), &self.physical),
             "device and process address spaces use different DRAM"
         );
+        let handler = self.flush_handler.lock();
         assert!(
             self.process.set(process).is_ok(),
             "a process is already attached to this device address space"
         );
+        self.install_flush_sink(handler.clone());
     }
 
     /// Tracks the physical pages behind the mapped pages of `[daddr, daddr + size)` for CPU writes
@@ -114,10 +120,16 @@ impl DeviceAddressSpace {
         process.disarm_physical(&self.physical_runs(daddr, size));
     }
 
-    /// Installs the handler that flush traps of the attached process call, with each device page
-    /// that maps the trapped physical page; `None` removes it. A trap on a page no device page
-    /// maps, or with no handler, only removes itself.
+    /// Installs the handler that flush traps of the attached process, or of one attached later,
+    /// call with each device page that maps the trapped physical page; `None` removes it. A trap
+    /// on a page no device page maps, or with no handler, only removes itself.
     pub fn set_flush_trap_handler(&self, handler: Option<Arc<dyn FlushTrapHandler>>) {
+        let mut stored = self.flush_handler.lock();
+        stored.clone_from(&handler);
+        self.install_flush_sink(handler);
+    }
+
+    fn install_flush_sink(&self, handler: Option<Arc<dyn FlushTrapHandler>>) {
         let Some(process) = self.process.get() else {
             return;
         };
@@ -133,6 +145,13 @@ impl DeviceAddressSpace {
             }) as crate::address_space::FlushSink
         });
         process.set_flush_sink(sink);
+    }
+
+    /// Takes the attached process's flush trap counts gathered since the last call.
+    pub fn take_flush_trap_stats(&self) -> crate::FlushTrapStats {
+        self.process
+            .get()
+            .map_or_else(Default::default, |process| process.take_trap_stats())
     }
 
     /// Whether the attached process wrote a tracked page since the last
