@@ -775,7 +775,15 @@ impl VulkanRasterizer {
             return Ok(());
         }
         diag::with(|d| d.finish("ok"));
-        if diag::stats() && diag::with(|d| d.in_window()) == Some(true) {
+        let traced_fs = self
+            .draw
+            .stages
+            .iter()
+            .flatten()
+            .find(|m| m.stage == ShaderStage::Fragment)
+            .map_or(0, |m| m.hash);
+        let traced = diag::trace_fs().contains(&traced_fs);
+        if traced || (diag::stats() && diag::with(|d| d.in_window()) == Some(true)) {
             let small: Vec<ImageId> = self
                 .draw
                 .textures
@@ -788,7 +796,8 @@ impl VulkanRasterizer {
                 })
                 .collect();
             if !small.is_empty() {
-                self.diag_image_stats("draw-in", &small);
+                let label = format!("draw-in fs={traced_fs:016x}");
+                self.diag_image_stats(&label, &small, traced);
             }
         }
         let set = self.descriptor_set(set_layout)?;
@@ -2543,7 +2552,7 @@ impl VulkanRasterizer {
                 .chain(self.draw.storage_images.iter().map(|&(id, _)| id))
                 .collect();
             let label = format!("compute={:016x}", key.shader);
-            self.diag_image_stats(&label, &ids);
+            self.diag_image_stats(&label, &ids, false);
         }
         Ok(())
     }

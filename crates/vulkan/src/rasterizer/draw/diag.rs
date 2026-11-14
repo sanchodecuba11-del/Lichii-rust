@@ -171,6 +171,12 @@ pub(crate) fn flush_all() -> Option<u64> {
     })
 }
 
+/// LICHII_DIAG_TRACE_FS: fragment hashes whose draws log small-texture stats at any time.
+pub(crate) fn trace_fs() -> &'static [u64] {
+    static V: OnceLock<Vec<u64>> = OnceLock::new();
+    V.get_or_init(|| hex_list("LICHII_DIAG_TRACE_FS"))
+}
+
 pub(crate) fn state() -> Option<&'static Mutex<DrawDiag>> {
     static STATE: OnceLock<Option<Mutex<DrawDiag>>> = OnceLock::new();
     STATE
@@ -368,7 +374,21 @@ impl VulkanRasterizer {
     }
 
     /// Writes each image back to guest memory and logs its texel statistics as a STAT line.
-    pub(in crate::rasterizer) fn diag_image_stats(&mut self, label: &str, ids: &[ImageId]) {
+    pub(in crate::rasterizer) fn diag_image_stats(
+        &mut self,
+        label: &str,
+        ids: &[ImageId],
+        always: bool,
+    ) {
+        let log = |text: &str| {
+            with(|d| {
+                if always {
+                    d.always(text)
+                } else {
+                    d.event(text)
+                }
+            });
+        };
         for &id in ids {
             let Some(st) = self.texture_cache.state(id) else {
                 continue;
@@ -382,7 +402,7 @@ impl VulkanRasterizer {
             let spans = match self.texture_cache.diag_download(&mut tx, id) {
                 Ok(spans) => spans,
                 Err(error) => {
-                    with(|d| d.event(&format!("STAT {label} {id:?} download failed: {error}")));
+                    log(&format!("STAT {label} {id:?} download failed: {error}"));
                     continue;
                 }
             };
@@ -417,7 +437,7 @@ impl VulkanRasterizer {
                 st.gpu_modified,
                 texel_stats(st.info.format, &bytes)
             );
-            with(|d| d.event(&text));
+            log(&text);
         }
     }
 }
