@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{Ordering, fence};
 
 use lichii_common::{PAGE_BITS, PAGE_MASK, PAGE_SIZE, PAddr, VAddr};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::PhysicalMemory;
 use crate::fault::{FaultHandler, Registration};
@@ -217,14 +217,20 @@ impl AddressSpace {
         if let Err(err) = self.physical.commit(pa, size) {
             panic!("{err}");
         }
-        let mut tracking = self.update.lock();
+        let mut tracking = self.lock_for_rebuild(va, size);
+        let mut caps = Vec::new();
         for page in 0..size / PAGE_SIZE {
             let (addr, page_pa) = (va + page * PAGE_SIZE, pa + page * PAGE_SIZE);
             if let Some(old) = self.physical_address(addr) {
                 tracking.reverse.remove(old, addr);
             }
-            self.table.set(addr, self.physical.pointer(page_pa), perm);
+            let (flags, cap) = self.page_state(page_pa);
+            self.table
+                .set(addr, self.physical.pointer(page_pa), perm, flags);
             tracking.reverse.insert(page_pa, addr);
+            if let Some(cap) = cap {
+                caps.push((addr as usize, cap));
+            }
         }
         if let Some(fastmem) = &self.fastmem {
             fastmem
@@ -235,31 +241,16 @@ impl AddressSpace {
                     pa as usize,
                     size as usize,
                     perm.host(),
+                    &caps,
                 )
                 .unwrap_or_else(|err| panic!("fastmem map {va:#x}+{size:#x}: {err}"));
-        }
-        let mut aliases: Vec<VAddr> = (0..size / PAGE_SIZE)
-            .filter(|page| {
-                let page_pa = pa + page * PAGE_SIZE;
-                self.tracked.test(page_pa) || self.trapped.test(page_pa)
-            })
-            .map(|page| va + page * PAGE_SIZE)
-            .collect();
-        self.sync_pages(&mut aliases);
-        if self.fastmem.is_some() {
-            for page in 0..size / PAGE_SIZE {
-                let page_pa = pa + page * PAGE_SIZE;
-                if self.tracked.test(page_pa) {
-                    self.dirty.mark(page_pa);
-                }
-            }
         }
         self.publish_exposed();
         drop(tracking);
     }
 
     pub fn unmap(&self, va: VAddr, size: u64) {
-        let mut tracking = self.update.lock();
+        let mut tracking = self.lock_for_rebuild(va, size);
         self.clear_pages(&mut tracking, va, size);
         if let Some(fastmem) = &self.fastmem {
             fastmem
@@ -310,7 +301,7 @@ impl AddressSpace {
     /// Changes the permission of the mapped pages of `[va, va + size)`. Write-tracked pages
     /// stay write-protected in the fastmem arena, and pages with a flush trap inaccessible.
     pub fn protect(&self, va: VAddr, size: u64, perm: MemoryPermission) {
-        let _update = self.update.lock();
+        let _update = self.lock_for_rebuild(va, size);
         let start = va & !PAGE_MASK;
         let pages = (va + size).div_ceil(PAGE_SIZE) - start / PAGE_SIZE;
         let mut run: Option<(VAddr, u64)> = None;
@@ -328,6 +319,43 @@ impl AddressSpace {
             self.protect_host(s, len, perm);
         }
         self.publish_exposed();
+    }
+
+    /// Locks `update` for a change to the fastmem views over `[va, va + size)`. Rebuilding a view
+    /// maps it accessible before it can be protected again (Windows), so the GPU first writes
+    /// back the trapped pages a rebuild would expose; pages armed again meanwhile are written
+    /// back on the next attempt, and after the last the change goes ahead regardless.
+    fn lock_for_rebuild(&self, va: VAddr, size: u64) -> MutexGuard<'_, Tracking> {
+        const ATTEMPTS: usize = 4;
+        for _ in 1..ATTEMPTS {
+            let tracking = self.update.lock();
+            let exposed = self.fastmem.as_ref().map_or_else(Vec::new, |fastmem| {
+                fastmem
+                    .arena
+                    .trapped_in_rebuilt_views(va as usize, size as usize)
+            });
+            if exposed.is_empty() {
+                return tracking;
+            }
+            drop(tracking);
+            for page in exposed {
+                self.flush_trap(page as VAddr);
+            }
+        }
+        self.update.lock()
+    }
+
+    /// The table flags and fastmem cap a virtual page mapping physical page `pa` gets: a tracked
+    /// page's view is write-protected, a trapped page's view inaccessible.
+    fn page_state(&self, pa: PAddr) -> (usize, Option<HostProtection>) {
+        match (self.tracked.test(pa), self.trapped.test(pa)) {
+            (tracked, true) => (
+                FLUSH_TRAP | if tracked { TRACKED } else { 0 },
+                Some(HostProtection::None),
+            ),
+            (true, false) => (TRACKED, Some(HostProtection::Read)),
+            (false, false) => (0, None),
+        }
     }
 
     /// Publishes as written the tracked pages whose fastmem views had to be mapped again (and so
@@ -362,17 +390,9 @@ impl AddressSpace {
             let Some(pa) = self.physical_address(va) else {
                 continue;
             };
-            let (tracked, trapped) = (self.tracked.test(pa), self.trapped.test(pa));
-            let flags = if tracked { TRACKED } else { 0 } | if trapped { FLUSH_TRAP } else { 0 };
+            let (flags, cap) = self.page_state(pa);
             let Some(perm) = self.table.set_flags(va, flags) else {
                 continue;
-            };
-            let cap = if trapped {
-                Some(HostProtection::None)
-            } else if tracked {
-                Some(HostProtection::Read)
-            } else {
-                None
             };
             match &mut run {
                 Some((start, size, p, c)) if *start + *size == va && *p == perm && *c == cap => {

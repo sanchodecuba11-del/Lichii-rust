@@ -151,7 +151,8 @@ impl Arena {
     }
 
     /// Maps `len` bytes of `backing` at `backing_offset` to `offset` in the arena, replacing any
-    /// view there.
+    /// view there. `caps` restricts pages of the new view, by offset, from the start.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn map(
         &self,
         backing: &Backing,
@@ -159,10 +160,12 @@ impl Arena {
         backing_offset: usize,
         len: usize,
         prot: HostProtection,
+        caps: &[(usize, HostProtection)],
     ) -> io::Result<()> {
         assert!(offset + len <= self.size && backing_offset + len <= backing.size);
         let mut restricted = self.restricted.lock();
         Self::forget_restricted(&mut restricted, offset, len);
+        restricted.extend(caps.iter().copied());
         self.sys.map(
             self.base,
             &backing.sys,
@@ -221,6 +224,23 @@ impl Arena {
             };
         }
         self.sys.restrict(self.base, offset, len, prot, cap)
+    }
+
+    /// Offsets of the trapped pages (capped at no access) that a change to the views over
+    /// `[offset, offset + len)` would map accessible for a moment: none where views can be
+    /// protected as they are mapped.
+    pub(crate) fn trapped_in_rebuilt_views(&self, offset: usize, len: usize) -> Vec<usize> {
+        let restricted = self.restricted.lock();
+        let mut trapped = Vec::new();
+        for (start, end) in self.sys.rebuilt_views(offset, len) {
+            trapped.extend(
+                restricted
+                    .range(start..end)
+                    .filter(|(_, cap)| **cap == HostProtection::None)
+                    .map(|(&page, _)| page),
+            );
+        }
+        trapped
     }
 
     /// Offsets of restricted pages whose views had to be mapped again since the last call.
@@ -404,23 +424,29 @@ mod sys {
             backing_offset: usize,
             len: usize,
             prot: HostProtection,
-            _restricted: &Restricted,
+            restricted: &Restricted,
         ) -> io::Result<()> {
-            // SAFETY: the target range lies inside the arena reservation this struct owns.
-            let ptr = unsafe {
-                libc::mmap(
-                    base.add(offset).cast(),
-                    len,
-                    prot_flags(prot),
-                    libc::MAP_SHARED | libc::MAP_FIXED,
-                    backing.fd,
-                    backing_offset as libc::off_t,
-                )
-            };
-            if ptr == libc::MAP_FAILED {
-                return Err(io::Error::last_os_error());
+            for (start, run, prot) in protection_runs(restricted, offset, offset + len, prot) {
+                // SAFETY: the run lies inside the arena reservation this struct owns.
+                let ptr = unsafe {
+                    libc::mmap(
+                        base.add(start).cast(),
+                        run,
+                        prot_flags(prot),
+                        libc::MAP_SHARED | libc::MAP_FIXED,
+                        backing.fd,
+                        (backing_offset + (start - offset)) as libc::off_t,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
+                }
             }
             Ok(())
+        }
+
+        pub fn rebuilt_views(&self, _offset: usize, _len: usize) -> Vec<(usize, usize)> {
+            Vec::new()
         }
 
         pub fn unmap(
@@ -795,6 +821,20 @@ mod sys {
 
         pub fn take_exposed(&self) -> Vec<usize> {
             std::mem::take(&mut *self.exposed.lock())
+        }
+
+        /// The views overlapping `[offset, offset + len)` without lying inside it, as (start, end):
+        /// a map, unmap or protect there unmaps them and maps them again.
+        pub fn rebuilt_views(&self, offset: usize, len: usize) -> Vec<(usize, usize)> {
+            let end = offset + len;
+            self.views
+                .lock()
+                .range(..end)
+                .rev()
+                .take_while(|(s, v)| **s + v.len > offset)
+                .filter(|(s, v)| **s < offset || **s + v.len > end)
+                .map(|(s, v)| (*s, *s + v.len))
+                .collect()
         }
 
         #[cfg(test)]

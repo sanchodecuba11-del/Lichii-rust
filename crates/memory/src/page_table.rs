@@ -50,9 +50,10 @@ impl PageTable {
         self.bits
     }
 
-    pub(crate) fn set(&self, addr: u64, host: *mut u8, perm: MemoryPermission) {
+    /// Maps `addr` to `host` with `perm` and the [`TRACKED`] and [`FLUSH_TRAP`] bits of `flags`.
+    pub(crate) fn set(&self, addr: u64, host: *mut u8, perm: MemoryPermission, flags: usize) {
         self.entry_for_write(addr)
-            .store(host as usize | perm.0 as usize, Ordering::Release);
+            .store(host as usize | perm.0 as usize | flags, Ordering::Release);
     }
 
     pub(crate) fn clear(&self, addr: u64) {
@@ -108,7 +109,8 @@ impl PageTable {
     }
 
     /// Host pointer for an access to `addr` that needs `need`. On a page with a flush trap it
-    /// calls `trap` with `addr` first, then accesses the page whatever the trap did.
+    /// calls `trap` with `addr` first, then accesses the page whatever the trap did, unless `addr`
+    /// was remapped meanwhile to another page with a flush trap, which traps in turn.
     #[inline]
     pub(crate) fn access_with(
         &self,
@@ -135,9 +137,13 @@ impl PageTable {
         need: MemoryPermission,
         trap: &impl Fn(u64),
     ) -> Result<*mut u8, MemoryFault> {
-        if raw & FLUSH_TRAP != 0 {
+        while raw & FLUSH_TRAP != 0 {
             trap(addr);
+            let trapped = raw;
             raw = entry.load(Ordering::Acquire);
+            if raw & !PERM_MASK == trapped & !PERM_MASK {
+                break;
+            }
         }
         if raw == 0 {
             return Err(MemoryFault::unmapped(addr));
@@ -317,5 +323,51 @@ impl Drop for PageTable {
                 drop(unsafe { Box::from_raw(table) });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[repr(align(4096))]
+    struct Page([u8; 4096]);
+
+    const ADDR: u64 = 0x8000_0000;
+    const RW: MemoryPermission = MemoryPermission::READ_WRITE;
+
+    #[test]
+    fn an_access_remapped_to_another_trapped_page_during_its_trap_traps_again() {
+        let table = PageTable::new(39);
+        let mut pages = [Page([0; 4096]), Page([0; 4096])];
+        let [a, b] = pages.each_mut().map(|page| page.0.as_mut_ptr());
+        table.set(ADDR, a, RW, FLUSH_TRAP);
+        let traps = Cell::new(0);
+        let remap = |addr: u64| {
+            assert_eq!(addr, ADDR + 0x10);
+            traps.set(traps.get() + 1);
+            let flags = if traps.get() == 1 { FLUSH_TRAP } else { 0 };
+            table.set(ADDR, b, RW, flags);
+        };
+        let ptr = table
+            .access_with(ADDR + 0x10, MemoryPermission::READ, &remap)
+            .unwrap();
+        assert_eq!(traps.get(), 2, "the page it was remapped to trapped too");
+        assert_eq!(ptr, b.wrapping_add(0x10));
+
+        table.set(ADDR, a, RW, FLUSH_TRAP);
+        traps.set(0);
+        let ignore = |_: u64| traps.set(traps.get() + 1);
+        let ptr = table
+            .access_with(ADDR + 0x10, MemoryPermission::READ, &ignore)
+            .unwrap();
+        assert_eq!(
+            traps.get(),
+            1,
+            "a page its trap left trapped is accessed anyway"
+        );
+        assert_eq!(ptr, a.wrapping_add(0x10));
     }
 }

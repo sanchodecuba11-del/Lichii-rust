@@ -373,6 +373,52 @@ mod faults {
         space.unmap(0x5000_0000, 0x1000);
     }
 
+    /// Records each flush and disarms what it flushed.
+    struct Recorder {
+        calls: parking_lot::Mutex<Vec<(u64, u64)>>,
+        device: std::sync::Weak<DeviceAddressSpace>,
+    }
+
+    impl crate::FlushTrapHandler for Recorder {
+        fn flush_for_cpu(&self, daddr: u64, size: u64) {
+            self.calls.lock().push((daddr, size));
+            if let Some(device) = self.device.upgrade() {
+                device.disarm_flush_traps(daddr, size);
+            }
+        }
+    }
+
+    #[test]
+    fn rebuilding_a_view_writes_its_trapped_pages_back_first() {
+        let Some((space, device)) = tracked_space() else {
+            return;
+        };
+        let device = Arc::new(device);
+        let recorder = Arc::new(Recorder {
+            calls: Default::default(),
+            device: Arc::downgrade(&device),
+        });
+        device.set_flush_trap_handler(Some(recorder.clone()));
+        space.map(0x4000_0000, 0x10_0000, 0x4000, MemoryPermission::READ_WRITE);
+        device
+            .map_process(0x1_0000_0000, &space, 0x4000_0000, 0x4000)
+            .unwrap();
+        device.arm_flush_traps(0x1_0000_1000, 0x1000);
+
+        space.protect(0x4000_0000, 0x4000, MemoryPermission::READ);
+        assert!(
+            recorder.calls.lock().is_empty(),
+            "protecting a whole view rebuilds nothing"
+        );
+        space.protect(0x4000_3000, 0x1000, MemoryPermission::READ_WRITE);
+        let rebuilt = cfg!(windows).then_some((0x1_0000_1000, 0x1000));
+        assert_eq!(
+            recorder.calls.lock().as_slice(),
+            rebuilt.as_slice(),
+            "splitting the view writes back its trapped page only where the split exposes it"
+        );
+    }
+
     #[test]
     fn views_mapped_again_over_tracked_pages_publish_them() {
         let faults = AtomicU64::new(0);
@@ -427,8 +473,12 @@ mod faults {
         device.take_cpu_writes(|daddr, size| found.push((daddr, size)));
         assert_eq!(
             found,
-            [(0x1_0000_1000, 0x1000)],
-            "a new alias was briefly writable"
+            if cfg!(windows) {
+                &[(0x1_0000_1000, 0x1000)][..]
+            } else {
+                &[]
+            },
+            "only Windows maps a new alias writable before it can protect it"
         );
         space.unmap(0x5000_0000, 0x1000);
     }
