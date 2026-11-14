@@ -94,6 +94,11 @@ pub(crate) fn samples1() -> bool {
     *V.get_or_init(|| flag("LICHII_DIAG_SAMPLES1"))
 }
 
+pub(crate) fn stats() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("LICHII_DIAG_STATS"))
+}
+
 pub(crate) fn state() -> Option<&'static Mutex<DrawDiag>> {
     static STATE: OnceLock<Option<Mutex<DrawDiag>>> = OnceLock::new();
     STATE
@@ -135,6 +140,11 @@ impl DrawDiag {
         }
     }
 
+    pub(crate) fn in_window(&self) -> bool {
+        let t = now();
+        t >= self.from && t <= self.to
+    }
+
     pub(crate) fn event(&mut self, text: &str) {
         let t = now();
         if t >= self.from && t <= self.to + Duration::from_secs(1) {
@@ -166,7 +176,147 @@ use lichii_texture::tic::TicEntry;
 
 use super::super::VulkanRasterizer;
 use super::{DrawCall, StageSources, render_target_index};
-use crate::texture_cache::ImageId;
+use crate::texture_cache::{ImageId, Transfer};
+use lichii_texture::PixelFormat;
+
+const STATS_MAX_BYTES: u64 = 96 << 20;
+
+fn small_float(bits: u32, mantissa: u32, signed: bool) -> f32 {
+    let sign = if signed && bits >> (mantissa + 5) & 1 != 0 {
+        -1.0
+    } else {
+        1.0
+    };
+    let exp = (bits >> mantissa) & 31;
+    let man = bits & ((1 << mantissa) - 1);
+    let frac = man as f32 / (1u32 << mantissa) as f32;
+    sign * match exp {
+        31 if man == 0 => f32::INFINITY,
+        31 => f32::NAN,
+        0 => frac * 2f32.powi(-14),
+        e => (1.0 + frac) * 2f32.powi(e as i32 - 15),
+    }
+}
+
+/// Per-channel NaN, Inf, negative and zero counts with finite min, max and mean.
+pub(crate) fn texel_stats(format: PixelFormat, bytes: &[u8]) -> String {
+    use PixelFormat as F;
+    let words = || {
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    };
+    let halves = || {
+        bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]) as u32)
+    };
+    let (channels, lanes): (usize, Vec<f32>) = match format {
+        F::R32G32B32A32Float => (4, words().map(f32::from_bits).collect()),
+        F::R32G32B32Float => (3, words().map(f32::from_bits).collect()),
+        F::R32G32Float => (2, words().map(f32::from_bits).collect()),
+        F::R32Float => (1, words().map(f32::from_bits).collect()),
+        F::R16G16B16A16Float | F::R16G16B16X16Float => {
+            (4, halves().map(|h| small_float(h, 10, true)).collect())
+        }
+        F::R16G16Float => (2, halves().map(|h| small_float(h, 10, true)).collect()),
+        F::R16Float => (1, halves().map(|h| small_float(h, 10, true)).collect()),
+        F::B10G11R11Float => (
+            3,
+            words()
+                .flat_map(|w| {
+                    [
+                        small_float(w & 0x7ff, 6, false),
+                        small_float((w >> 11) & 0x7ff, 6, false),
+                        small_float(w >> 22, 5, false),
+                    ]
+                })
+                .collect(),
+        ),
+        _ => (4, bytes.iter().map(|&b| b as f32 / 255.0).collect()),
+    };
+    let mut out = format!("lanes={}", lanes.len());
+    for c in 0..channels {
+        let (mut nan, mut inf, mut neg, mut zero, mut n) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut lo, mut hi, mut sum) = (f32::MAX, f32::MIN, 0f64);
+        for &v in lanes.iter().skip(c).step_by(channels) {
+            if v.is_nan() {
+                nan += 1;
+            } else if v.is_infinite() {
+                inf += 1;
+            } else {
+                n += 1;
+                neg += u64::from(v < 0.0);
+                zero += u64::from(v == 0.0);
+                lo = lo.min(v);
+                hi = hi.max(v);
+                sum += f64::from(v);
+            }
+        }
+        let mean = if n == 0 { 0.0 } else { sum / n as f64 };
+        let _ = write!(
+            out,
+            " c{c}[nan={nan} inf={inf} neg={neg} zero={zero} min={lo:.4e} max={hi:.4e} mean={mean:.4e}]"
+        );
+    }
+    out
+}
+
+impl VulkanRasterizer {
+    /// Writes each image back to guest memory and logs its texel statistics as a STAT line.
+    pub(in crate::rasterizer) fn diag_image_stats(&mut self, label: &str, ids: &[ImageId]) {
+        for &id in ids {
+            let Some(st) = self.texture_cache.state(id) else {
+                continue;
+            };
+            let mut tx = Transfer {
+                scheduler: &mut self.scheduler,
+                staging: &mut self.staging,
+                memory: &self.handles.device,
+                buffers: &mut self.buffer_cache,
+            };
+            let spans = match self.texture_cache.diag_download(&mut tx, id) {
+                Ok(spans) => spans,
+                Err(error) => {
+                    with(|d| d.event(&format!("STAT {label} {id:?} download failed: {error}")));
+                    continue;
+                }
+            };
+            let total: u64 = spans.iter().map(|s| s.1).sum();
+            if total > STATS_MAX_BYTES {
+                with(|d| {
+                    d.event(&format!(
+                        "STAT {label} {id:?} {:?} too large {total}",
+                        st.info.format
+                    ))
+                });
+                continue;
+            }
+            let mut bytes = vec![0u8; total as usize];
+            let mut at = 0usize;
+            let mut fault = false;
+            for (daddr, size) in spans {
+                fault |= self
+                    .handles
+                    .device
+                    .read_bytes(daddr, &mut bytes[at..at + size as usize])
+                    .is_err();
+                at += size as usize;
+            }
+            let text = format!(
+                "STAT {label} {id:?} {:?} {}x{}x{} lv={} gpu_mod={} fault={fault} {}",
+                st.info.format,
+                st.info.width,
+                st.info.height,
+                st.info.layers,
+                st.info.levels,
+                st.gpu_modified,
+                texel_stats(st.info.format, &bytes)
+            );
+            with(|d| d.event(&text));
+        }
+    }
+}
 
 impl VulkanRasterizer {
     pub(super) fn diag_draw_state(&mut self, ctx: &GraphicsContext<'_>, call: DrawCall<'_>) {

@@ -1277,6 +1277,23 @@ impl TextureCache {
         result
     }
 
+    /// Diagnostic only: writes `id` back to guest memory when it is GPU-modified, and returns the
+    /// guest spans it occupies.
+    pub fn diag_download(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        id: ImageId,
+    ) -> Result<Vec<(DAddr, u64)>> {
+        let Some(image) = self.get(id) else {
+            return Ok(Vec::new());
+        };
+        let spans = image.segments.iter().map(|s| (s.daddr, s.size)).collect();
+        if image.gpu_modified && image.downloadable() {
+            self.download(tx, &[id], None)?;
+        }
+        Ok(spans)
+    }
+
     /// Device memory `[daddr, daddr + size)` was unmapped: drop the images in it.
     pub fn unmap(&mut self, scheduler: &mut Scheduler, daddr: DAddr, size: u64) {
         self.collect_overlaps(&[Segment {

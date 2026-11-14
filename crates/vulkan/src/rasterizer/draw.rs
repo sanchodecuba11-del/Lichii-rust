@@ -775,6 +775,22 @@ impl VulkanRasterizer {
             return Ok(());
         }
         diag::with(|d| d.finish("ok"));
+        if diag::stats() && diag::with(|d| d.in_window()) == Some(true) {
+            let small: Vec<ImageId> = self
+                .draw
+                .textures
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    self.texture_cache
+                        .state(id)
+                        .is_some_and(|s| s.info.width * s.info.height <= 4096)
+                })
+                .collect();
+            if !small.is_empty() {
+                self.diag_image_stats("draw-in", &small);
+            }
+        }
         let set = self.descriptor_set(set_layout)?;
 
         let task = self.draw.stages[0]
@@ -2518,6 +2534,17 @@ impl VulkanRasterizer {
             }
         }
         self.unflushed = true;
+        if diag::stats() && diag::with(|d| d.in_window()) == Some(true) {
+            let ids: Vec<ImageId> = self
+                .draw
+                .textures
+                .iter()
+                .copied()
+                .chain(self.draw.storage_images.iter().map(|&(id, _)| id))
+                .collect();
+            let label = format!("compute={:016x}", key.shader);
+            self.diag_image_stats(&label, &ids);
+        }
         Ok(())
     }
 }
