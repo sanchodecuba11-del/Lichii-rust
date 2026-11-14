@@ -354,15 +354,11 @@ impl VulkanRasterizer {
             live: None,
             activity: Activity::default(),
             stalls: Stalls::default(),
-<<<<<<< HEAD
             frame_dump: {
                 draw::diag::init();
                 frame_dump::FrameDump::from_env()
             },
-=======
-            frame_dump: frame_dump::FrameDump::from_env(),
             teardown: Teardown(Vec::new()),
->>>>>>> origin/main
         })
     }
 
