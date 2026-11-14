@@ -466,6 +466,7 @@ impl Machine {
                 let mut jit = Jit::new(config).unwrap();
                 jit.target.sse41 = false;
                 jit.target.sse42 = false;
+                jit.target.avx2 = false;
                 Box::new(jit)
             }
         };
@@ -476,7 +477,7 @@ impl Machine {
         let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.mem.write_bytes(CODE, &bytes).unwrap();
         self.mem.write_bytes(DATA, data).unwrap();
-        self.core.clear_code_cache();
+        self.core.invalidate_code(CODE, CODE_SIZE);
         let mut ctx = ctx.clone();
         let halt = self.core.run(&mut ctx);
         let mut data = vec![0; (DATA_SIZE + 0x1000) as usize];
@@ -828,7 +829,12 @@ fn simd_runs_mid_block_on_the_live_context() {
 /// FPSR.IXC both clear and already set.
 #[test]
 fn fp_edge_cases_match_the_interpreter() {
-    const OPS: [u32; 26] = [
+    const OPS: [u32; 37] = [
+        0x1e24_4020, // frintn s0, s1
+        0x1e24_c020, // frintp s0, s1
+        0x1e25_4020, // frintm s0, s1
+        0x1e25_c020, // frintz s0, s1
+        0x1e26_4020, // frinta s0, s1
         0x1e22_4820, // fmax s0, s1, s2
         0x1e22_5820, // fmin s0, s1, s2
         0x1e22_6820, // fmaxnm s0, s1, s2
@@ -855,11 +861,18 @@ fn fp_edge_cases_match_the_interpreter() {
         0x1e22_1425, // fccmp s1, s2, #5, ne
         0x1e22_0435, // fccmpe s1, s2, #5, eq
         0x1e22_1435, // fccmpe s1, s2, #5, ne
+        0x1e20_0020, // fcvtns w0, s1
+        0x1e28_0020, // fcvtps w0, s1
+        0x1e30_0020, // fcvtms w0, s1
+        0x1e29_0020, // fcvtpu w0, s1
+        0x9e30_0020, // fcvtms x0, s1
+        0x9e21_0020, // fcvtnu x0, s1
     ];
     let machines = &mut [
         ("interpreter", Machine::new(Backend::Interpreter)),
         ("jit", Machine::new(Backend::Jit(Passes::ALL))),
         ("jit without fma", Machine::new(Backend::NoFma)),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
     ];
     let data = vec![0u8; DATA_SIZE as usize];
     let fpcrs = [0, 1 << 24, 1 << 25, 3 << 22];
@@ -1725,7 +1738,7 @@ fn counter_reads_follow_the_tsc_scale() {
             accuracy: CpuAccuracy::Auto,
         })
         .unwrap();
-        assert!(jit.target.tsc_scale.is_some());
+        assert!(jit.target.tsc_scale);
         let mut ctx = ThreadContext {
             pc: CODE,
             ..Default::default()
@@ -2010,7 +2023,7 @@ fn run_profiled(
 
 /// A scalar product, fused product, quotient or narrowing conversion whose result is zero because a
 /// factor, the dividend or the source is zero stays native; an underflow to zero still falls back, and an inexact op with
-/// FPSR.IXC clear is counted apart from it.
+/// FPSR.IXC clear that has no native exactness check is counted apart from it.
 #[test]
 fn zero_factor_products_stay_native() {
     const PROGRAM: [u32; 10] = [
@@ -2022,7 +2035,7 @@ fn zero_factor_products_stay_native() {
         0x1e6d_098a, // fmul d10, d12, d13
         0x1e27_08e6, // fmul s6, s7, s7
         0xd51b_443f, // msr fpsr, xzr
-        0x1e29_0848, // fmul s8, s2, s9
+        0x1e21_c128, // fsqrt s8, s9
         BRK,
     ];
     let mut ctx = ThreadContext {
@@ -2050,7 +2063,7 @@ fn zero_factor_products_stay_native() {
             "native FP slow paths, inputs or result: {}\n",
             1 + fused_slow
         ),
-        "FP 2-source 0x1e200800".to_string(),
+        "FP 1-source 0x1e21c000".to_string(),
     ] {
         assert!(table.contains(&line), "{line:?} in\n{table}");
     }
@@ -2535,5 +2548,599 @@ fn stores_to_gpu_cached_pages_land_and_are_reported() {
                 "{name} {what}: the page stays untracked"
             );
         }
+    }
+}
+
+fn shared_cores(n: usize) -> (Arc<AddressSpace>, Vec<Jit>) {
+    let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+    let mem = Arc::new(AddressSpace::with_fastmem(physical, 39).unwrap());
+    mem.map(CODE, 0, CODE_SIZE, MemoryPermission::READ_EXECUTE);
+    mem.map(DATA, 0x10000, DATA_SIZE, MemoryPermission::READ_WRITE);
+    let monitor = Arc::new(ExclusiveMonitor::new(n));
+    let cores = (0..n)
+        .map(|core_index| {
+            Jit::new(CpuConfig {
+                memory: mem.clone(),
+                monitor: monitor.clone(),
+                clock: Arc::new(Clock::default()),
+                core_index,
+                ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+                dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+                accuracy: CpuAccuracy::Auto,
+            })
+            .unwrap()
+        })
+        .collect();
+    (mem, cores)
+}
+
+#[test]
+fn cores_of_one_process_share_translated_blocks() {
+    const MOV_X0_7: u32 = 0xd280_00e0;
+    const B_PLUS_8: u32 = 0x1400_0002;
+    let (mem, mut cores) = shared_cores(2);
+    for (i, word) in [MOV_X0_7, B_PLUS_8, BRK, BRK].into_iter().enumerate() {
+        mem.write(CODE + 4 * i as u64, word).unwrap();
+    }
+    let run = |core: &mut Jit| {
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        assert_eq!(core.run(&mut ctx), HaltReason::Breakpoint(0));
+        ctx.x[0]
+    };
+    assert_eq!(run(&mut cores[0]), 7);
+    let translated = cores[0].cache.shared_blocks();
+    assert!(translated > 0);
+    for core in &mut cores {
+        assert_eq!(run(core), 7);
+    }
+    assert_eq!(cores[1].cache.shared_blocks(), translated);
+}
+
+#[test]
+fn invalidation_on_one_core_reaches_every_core_and_its_links() {
+    const MOV_X0_1: u32 = 0xd280_0020;
+    const MOV_X0_2: u32 = 0xd280_0040;
+    const B_PLUS_8: u32 = 0x1400_0002;
+    let (mem, mut cores) = shared_cores(2);
+    let target = CODE + 0x100;
+    mem.write(CODE, B_PLUS_8).unwrap();
+    mem.write(CODE + 8, 0x1400_0000 | ((target - CODE - 8) / 4) as u32)
+        .unwrap();
+    mem.write(target, MOV_X0_1).unwrap();
+    mem.write(target + 4, BRK).unwrap();
+    let run = |core: &mut Jit| {
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        assert_eq!(core.run(&mut ctx), HaltReason::Breakpoint(0));
+        ctx.x[0]
+    };
+    for _ in 0..3 {
+        for core in &mut cores {
+            assert_eq!(run(core), 1);
+        }
+    }
+    mem.write(target, MOV_X0_2).unwrap();
+    cores[1].invalidate_code(target, 4);
+    assert_eq!(run(&mut cores[1]), 2);
+    cores[0].invalidate_code(target, 4);
+    for _ in 0..3 {
+        for core in &mut cores {
+            assert_eq!(run(core), 2);
+        }
+    }
+}
+
+#[test]
+fn cores_run_while_another_clears_the_shared_code() {
+    const THREADS: usize = 4;
+    let mut rng = Rng(0x5eed_1234_abcd_9876);
+    let streams: Vec<Vec<u32>> = (0..8)
+        .map(|_| {
+            let len = 8 + rng.below(32) as usize;
+            (0..len)
+                .map(|i| match rng.below(8) {
+                    0 => simd(&mut rng),
+                    1 => vector(&mut rng),
+                    2 => {
+                        let to = i + 1 + rng.below((len - i) as u64) as usize;
+                        branch(&mut rng, i, to)
+                    }
+                    _ => alu(&mut rng),
+                })
+                .chain([BRK])
+                .collect()
+        })
+        .collect();
+    let (mem, cores) = shared_cores(THREADS);
+    let mut reference = Machine::new(Backend::Interpreter);
+    let slot = |i: usize| CODE + 0x400 * i as u64;
+    let mut expected = Vec::new();
+    for (i, code) in streams.iter().enumerate() {
+        let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        mem.write_bytes(slot(i), &bytes).unwrap();
+        reference.mem.write_bytes(slot(i), &bytes).unwrap();
+        let mut ctx = ThreadContext {
+            pc: slot(i),
+            sp: DATA + 0x4000,
+            ..Default::default()
+        };
+        let halt = reference.core.run(&mut ctx);
+        expected.push((halt, ctx.x));
+    }
+    std::thread::scope(|scope| {
+        for (t, mut core) in cores.into_iter().enumerate() {
+            let (streams, expected) = (&streams, &expected);
+            scope.spawn(move || {
+                for round in 0..3000 {
+                    let i = (round + t) % streams.len();
+                    let (want_halt, want_x) = &expected[i];
+                    if *want_halt != HaltReason::Breakpoint(0) {
+                        continue;
+                    }
+                    let mut ctx = ThreadContext {
+                        pc: slot(i),
+                        sp: DATA + 0x4000,
+                        ..Default::default()
+                    };
+                    let mut halt = core.run(&mut ctx);
+                    while let HaltReason::InvalidateCode { .. } = halt {
+                        halt = core.run(&mut ctx);
+                    }
+                    assert_eq!(halt, HaltReason::Breakpoint(0));
+                    assert_eq!(ctx.x, *want_x, "stream {i} on core {t}");
+                    if t == 0 && round % 10 == 0 {
+                        core.clear_code_cache();
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn core_on(
+    mem: &Arc<AddressSpace>,
+    core_index: usize,
+    clock: Arc<dyn GuestClock>,
+    ctr_el0: u32,
+) -> Jit {
+    Jit::new(CpuConfig {
+        memory: mem.clone(),
+        monitor: Arc::new(ExclusiveMonitor::new(core_index + 1)),
+        clock,
+        core_index,
+        ctr_el0,
+        dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+        accuracy: CpuAccuracy::Auto,
+    })
+    .unwrap()
+}
+
+fn run_to_brk(core: &mut Jit) -> [u64; 31] {
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        ..Default::default()
+    };
+    assert_eq!(core.run(&mut ctx), HaltReason::Breakpoint(0));
+    ctx.x
+}
+
+#[test]
+fn a_translation_that_raced_an_invalidation_is_not_shared() {
+    const MOV_X0_1: u32 = 0xd280_0020;
+    const MOV_X0_2: u32 = 0xd280_0040;
+    let (mem, mut cores) = shared_cores(2);
+    mem.write(CODE, MOV_X0_1).unwrap();
+    mem.write(CODE + 4, BRK).unwrap();
+    let seen = cores[0].cache.invalidations();
+    mem.write(CODE, MOV_X0_2).unwrap();
+    cores[1].invalidate_code(CODE, 4);
+    let stale = Err(decode(MOV_X0_1));
+    assert!(cores[0].cache.insert(CODE, 4, stale, seen).is_none());
+    assert_eq!(cores[0].cache.shared_blocks(), 0);
+    for core in &mut cores {
+        assert_eq!(run_to_brk(core)[0], 2);
+    }
+}
+
+struct Configured(u64);
+
+impl GuestClock for Configured {
+    fn ticks(&self) -> u64 {
+        0
+    }
+
+    fn frequency(&self) -> u64 {
+        self.0
+    }
+}
+
+#[test]
+fn cores_with_other_clocks_or_registers_do_not_share_blocks() {
+    const MRS_X0_CNTFRQ: u32 = 0xd53b_e000;
+    const MRS_X1_CTR: u32 = 0xd53b_0021;
+    let (mem, _) = shared_cores(0);
+    for (i, word) in [MRS_X0_CNTFRQ, MRS_X1_CTR, BRK].into_iter().enumerate() {
+        mem.write(CODE + 4 * i as u64, word).unwrap();
+    }
+    let ctr = CpuConfig::DEFAULT_CTR_EL0;
+    let mut cores = [
+        core_on(&mem, 0, Arc::new(Configured(19_200_000)), ctr),
+        core_on(&mem, 1, Arc::new(Configured(1_000_000)), ctr),
+        core_on(&mem, 2, Arc::new(Configured(19_200_000)), ctr ^ 1),
+    ];
+    let expected = [(19_200_000, ctr), (1_000_000, ctr), (19_200_000, ctr ^ 1)];
+    for (core, (frequency, ctr)) in cores.iter_mut().zip(expected) {
+        let x = run_to_brk(core);
+        assert_eq!((x[0], x[1]), (frequency, u64::from(ctr)));
+        assert_eq!(core.cache.adopted(), 0);
+    }
+}
+
+#[test]
+fn cores_sharing_code_read_their_own_tsc_scale() {
+    const MRS_X0_CNTVCT: u32 = 0xd53b_e040;
+    let (mem, _) = shared_cores(0);
+    mem.write(CODE, MRS_X0_CNTVCT).unwrap();
+    mem.write(CODE + 4, BRK).unwrap();
+    let ctr = CpuConfig::DEFAULT_CTR_EL0;
+    let mut cores = [12345, 67890]
+        .map(|offset| Arc::new(TscClock(TscScale::new(0, 0, offset))))
+        .into_iter()
+        .enumerate()
+        .map(|(i, clock)| core_on(&mem, i, clock, ctr))
+        .collect::<Vec<_>>();
+    assert_eq!(run_to_brk(&mut cores[0])[0], 12345);
+    assert_eq!(run_to_brk(&mut cores[1])[0], 67890);
+    assert!(cores[1].cache.adopted() > 0);
+}
+
+/// While FPSR.IXC is clear, scalar sums and S products and quotients stay native and set IXC
+/// exactly when their result is rounded. Small integers, powers of two and scaled integers make
+/// many results exact; random bits make most of them rounded.
+#[test]
+fn ixc_clear_arithmetic_sets_ixc_only_for_rounded_results() {
+    const OPS: [u32; 9] = [
+        0x1e22_2820, // fadd s0, s1, s2
+        0x1e22_3820, // fsub s0, s1, s2
+        0x1e22_0820, // fmul s0, s1, s2
+        0x1e22_1820, // fdiv s0, s1, s2
+        0x1e22_8820, // fnmul s0, s1, s2
+        0x1e62_2820, // fadd d0, d1, d2
+        0x1e62_3820, // fsub d0, d1, d2
+        0x1e62_0820, // fmul d0, d1, d2
+        0x1e62_1820, // fdiv d0, d1, d2
+    ];
+    let mut rng = Rng(0x1c5e_7a11_0dd5_eed5);
+    let mut value = |double: bool| {
+        let sign = if rng.below(2) == 0 { 1.0 } else { -1.0 };
+        let x = sign
+            * match rng.below(5) {
+                0 => rng.below(41) as f64,
+                1 if double => 2f64.powi(rng.below(2100) as i32 - 1076),
+                1 => 2f64.powi(rng.below(280) as i32 - 151),
+                2 => (rng.below(1 << 20) as f64) * 2f64.powi(rng.below(60) as i32 - 30),
+                3 => 1.0 + 2f64.powi(-(rng.below(60) as i32)),
+                _ if double => f64::from_bits(rng.next() >> 2),
+                _ => f32::from_bits(rng.next() as u32 >> 2) as f64,
+            };
+        if double {
+            x.to_bits() as u128
+        } else {
+            (x as f32).to_bits() as u128
+        }
+    };
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without fma", Machine::new(Backend::NoFma)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for i in 0..30_000 {
+        let op = OPS[i % OPS.len()];
+        let double = op & 1 << 22 != 0;
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            fpcr: if i % 4 == 3 { 1 << 24 } else { 0 },
+            ..Default::default()
+        };
+        ctx.v[1] = value(double);
+        ctx.v[2] = value(double);
+        compare(machines, &[op, BRK], &ctx, &data);
+    }
+    let program = [
+        0xd51b_443f,
+        OPS[0],
+        OPS[1],
+        OPS[2],
+        OPS[3],
+        OPS[4],
+        OPS[5],
+        OPS[6],
+        BRK,
+    ];
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        fpsr: 0x10,
+        ..Default::default()
+    };
+    ctx.v[1] = 3.0f32.to_bits() as u128;
+    ctx.v[2] = 0.1f32.to_bits() as u128;
+    let (halt, after, table) = run_profiled(&program, ctx, true);
+    assert_eq!(halt, HaltReason::Breakpoint(0));
+    assert_eq!(after.fpsr & 0x10, 0x10);
+    let table = table.unwrap();
+    assert!(!table.contains("FPSR.IXC clear"), "{table}");
+}
+
+/// `FCVTNS`, `FCVTPS`, `FCVTMS`, `FCVTAS` and the unsigned forms, and `FRINTN`/`P`/`M`/`Z`/`A`,
+/// round halves, near-integers and values at the edges of the W and X ranges exactly as the
+/// interpreter does, natively when the host has SSE4.1.
+#[test]
+fn rounding_conversions_match_the_interpreter() {
+    const OPS: [u32; 21] = [
+        0x1e24_0020, // fcvtas w0, s1
+        0x1e25_0020, // fcvtau w0, s1
+        0x9e24_0020, // fcvtas x0, s1
+        0x9e25_0020, // fcvtau x0, s1
+        0x1e24_4020, // frintn s0, s1
+        0x1e24_c020, // frintp s0, s1
+        0x1e25_4020, // frintm s0, s1
+        0x1e25_c020, // frintz s0, s1
+        0x1e26_4020, // frinta s0, s1
+        0x1e20_0020, // fcvtns w0, s1
+        0x1e21_0020, // fcvtnu w0, s1
+        0x1e28_0020, // fcvtps w0, s1
+        0x1e29_0020, // fcvtpu w0, s1
+        0x1e30_0020, // fcvtms w0, s1
+        0x1e31_0020, // fcvtmu w0, s1
+        0x9e20_0020, // fcvtns x0, s1
+        0x9e21_0020, // fcvtnu x0, s1
+        0x9e28_0020, // fcvtps x0, s1
+        0x9e29_0020, // fcvtpu x0, s1
+        0x9e30_0020, // fcvtms x0, s1
+        0x9e31_0020, // fcvtmu x0, s1
+    ];
+    let mut values: Vec<f64> = (-20..=20).map(|k| f64::from(k) * 0.5).collect();
+    values.extend([0.49999997, -0.49999997, 1.0000001, -2.9999998, 1e-3, -1e-3]);
+    values.extend([
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        1e-310,
+        -1e-40,
+    ]);
+    values.extend([
+        0.49999999999999994,
+        -0.49999999999999994,
+        4503599627370497.0,
+        8388609.0,
+    ]);
+    values.extend([
+        8388608.5,
+        -8388607.5,
+        2251799813685248.5,
+        -4503599627370495.5,
+    ]);
+    for edge in [2f64.powi(31), 2f64.powi(32), 2f64.powi(63), 2f64.powi(64)] {
+        values.extend([edge, -edge, edge - 0.5, edge - 1.0, edge - 1.5, 1.0 - edge]);
+    }
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for op in OPS {
+        for double in [false, true] {
+            for &x in &values {
+                for fpsr in [0, 0x10] {
+                    let mut ctx = ThreadContext {
+                        pc: CODE,
+                        fpsr,
+                        ..Default::default()
+                    };
+                    ctx.v[1] = match double {
+                        false => (x as f32).to_bits() as u128,
+                        true => x.to_bits() as u128,
+                    };
+                    let op = if double { op | 1 << 22 } else { op };
+                    compare(machines, &[op, BRK], &ctx, &data);
+                }
+            }
+        }
+    }
+}
+
+/// `TBL` with one register and `USHL` on S and D lanes against the interpreter: table indices
+/// below and above 16, and shift bytes from -70 to 70 (past the lane width both ways) as well as
+/// random ones, with random bits above each lane's low byte.
+#[test]
+fn table_lookups_and_register_shifts_match_the_interpreter() {
+    const OPS: [u32; 5] = [
+        0x0e02_0020, // tbl v0.8b, {v1.16b}, v2.8b
+        0x4e02_0020, // tbl v0.16b, {v1.16b}, v2.16b
+        0x2ea2_4420, // ushl v0.2s, v1.2s, v2.2s
+        0x6ea2_4420, // ushl v0.4s, v1.4s, v2.4s
+        0x6ee2_4420, // ushl v0.2d, v1.2d, v2.2d
+    ];
+    let mut rng = Rng(0x7ab1_e5e1_f7ed_0042);
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for i in 0..6000 {
+        let op = OPS[i % OPS.len()];
+        let bytes: [u8; 16] = std::array::from_fn(|_| match rng.below(4) {
+            0 => rng.below(16) as u8,
+            1 => (rng.below(141) as i32 - 70) as u8,
+            _ => rng.next() as u8,
+        });
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        ctx.v[0] = u128::from(rng.next()) << 64 | u128::from(rng.next());
+        ctx.v[1] = u128::from(rng.next()) << 64 | u128::from(rng.next());
+        ctx.v[2] = u128::from_le_bytes(bytes);
+        compare(machines, &[op, BRK], &ctx, &data);
+    }
+}
+
+/// Integer compares against zero (`CMGT`, `CMGE`, `CMEQ`, `CMLE`, `CMLT`) on every arrangement, and
+/// vector `FNEG`/`FABS` on S and D lanes, NaNs included, against the interpreter.
+#[test]
+fn zero_compares_and_sign_ops_match_the_interpreter() {
+    let mut ops = Vec::new();
+    for base in [
+        0x0e20_8820,
+        0x2e20_8820,
+        0x0e20_9820,
+        0x2e20_9820,
+        0x0e20_a820,
+    ] {
+        for size in 0..4 {
+            for q in [0, 1 << 30] {
+                if size < 3 || q != 0 {
+                    ops.push(base | size << 22 | q);
+                }
+            }
+        }
+    }
+    for base in [0x0ea0_f820, 0x2ea0_f820] {
+        ops.extend([base, base | 1 << 30, base | 1 << 30 | 1 << 22]);
+    }
+    let mut rng = Rng(0x2e20_8820_0ea0_f820);
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for i in 0..4000 {
+        let lane = |rng: &mut Rng| match rng.below(4) {
+            0 => 0,
+            1 => rng.interesting(),
+            _ => rng.next(),
+        };
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        ctx.v[0] = u128::from(rng.next()) << 64 | u128::from(rng.next());
+        ctx.v[1] = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        compare(machines, &[ops[i % ops.len()], BRK], &ctx, &data);
+    }
+}
+
+/// Vector `MLA`/`MLS` on H and S lanes, `NOT`, `FMOV` (vector, immediate) and the FP compares
+/// against zero against the interpreter, with NaN, zero, subnormal and normal lanes under FZ on
+/// and off.
+#[test]
+fn multiply_accumulate_not_fmov_and_fp_zero_compares_match_the_interpreter() {
+    let mut ops = Vec::new();
+    for base in [0x0e62_9420u32, 0x2e62_9420] {
+        for size in 1..3 {
+            ops.extend([
+                base & !(3 << 22) | size << 22,
+                base & !(3 << 22) | size << 22 | 1 << 30,
+            ]);
+        }
+    }
+    ops.extend([0x2e20_5820, 0x6e20_5820]);
+    for base in [
+        0x0ea0_c820,
+        0x0ea0_d820,
+        0x0ea0_e820,
+        0x2ea0_c820,
+        0x2ea0_d820,
+    ] {
+        ops.extend([base, base | 1 << 30, base | 1 << 30 | 1 << 22]);
+    }
+    let mut rng = Rng(0x0e62_9420_2ea0_d820);
+    for _ in 0..8 {
+        let imm8 = rng.below(256) as u32;
+        let (abc, defgh) = (imm8 >> 5, imm8 & 31);
+        let fmov = 0x0f00_f400 | abc << 16 | defgh << 5;
+        ops.extend([fmov, fmov | 1 << 30, fmov | 3 << 29]);
+    }
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    let lane = |rng: &mut Rng| -> u64 {
+        let s = |rng: &mut Rng| match rng.below(6) {
+            0 => 0,
+            1 => 0x8000_0000,
+            2 => FP_S[rng.below(FP_S.len() as u64) as usize] as u64,
+            3 => rng.below(0x0080_0000) | (rng.below(2) << 31),
+            _ => rng.next() & 0xffff_ffff,
+        };
+        match rng.below(3) {
+            0 => FP_D[rng.below(FP_D.len() as u64) as usize],
+            _ => s(rng) << 32 | s(rng),
+        }
+    };
+    for i in 0..12_000 {
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            fpcr: if i % 3 == 0 { 1 << 24 } else { 0 },
+            fpsr: if i % 2 == 0 { 0x10 } else { 0 },
+            ..Default::default()
+        };
+        for v in &mut ctx.v[..3] {
+            *v = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        }
+        compare(machines, &[ops[i % ops.len()], BRK], &ctx, &data);
+    }
+}
+
+/// `SRSHR`, `URSHR`, `SRSRA` and `URSRA` on H, S and (unsigned) D lanes, by every amount from 1
+/// to the lane width, against the interpreter.
+#[test]
+fn rounding_shifts_match_the_interpreter() {
+    let mut ops = Vec::new();
+    for (opcode, u) in [(0b00100, 0), (0b00100, 1), (0b00110, 0), (0b00110, 1)] {
+        for size in 1..4u32 {
+            let esize = 8 << size;
+            for shift in 1..=esize {
+                for q in [0, 1] {
+                    if size == 3 && (q == 0 || u == 0) {
+                        continue;
+                    }
+                    let immhb = 2 * esize - shift;
+                    ops.push(0x0f00_0420 | q << 30 | u << 29 | immhb << 16 | opcode << 11);
+                }
+            }
+        }
+    }
+    let mut rng = Rng(0x0f00_0420_5257_5348);
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for &op in ops.iter().cycle().take(8 * ops.len()) {
+        let lane = |rng: &mut Rng| match rng.below(3) {
+            0 => rng.interesting(),
+            _ => rng.next(),
+        };
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        ctx.v[0] = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        ctx.v[1] = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        compare(machines, &[op, BRK], &ctx, &data);
     }
 }

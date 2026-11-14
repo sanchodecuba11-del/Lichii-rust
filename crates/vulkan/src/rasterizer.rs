@@ -11,6 +11,7 @@ mod frame_dump;
 mod samples;
 
 use std::collections::VecDeque;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +41,7 @@ use crate::error::Result;
 use crate::format::{Conversion, host_format};
 use crate::memory::{Buffer, Image, ImageDesc};
 use crate::pipeline::PipelineCache;
+use crate::pipeline::shader_cache::ShaderCache;
 use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
@@ -64,6 +66,56 @@ struct Activity {
     submits: u32,
     textures: Traffic,
     buffers: BufferCacheStats,
+}
+
+/// Draws skipped while their shaders translated or their pipelines built, and the longest time
+/// between two presents, over the second since the last `draw stalls` line. The line is
+/// written at INFO, at most once a second, only for a second that skipped draws or held a
+/// present back for [`Stalls::SLOW_FRAME`] or more, so scene loads show up and steady play does not.
+#[derive(Default)]
+struct Stalls {
+    since: Option<Instant>,
+    last_present: Option<Instant>,
+    worst_frame: Duration,
+    presents: u32,
+    /// Shader and pipeline waits when the window started.
+    waits_at: (u64, u64),
+}
+
+impl Stalls {
+    const SLOW_FRAME: Duration = Duration::from_millis(50);
+
+    fn present(&mut self, now: Instant, shaders: &ShaderCache, pipelines: &PipelineCache) {
+        if let Some(last) = self.last_present.replace(now) {
+            self.worst_frame = self.worst_frame.max(now - last);
+        }
+        self.presents += 1;
+        let waits = (shaders.waits(), pipelines.waits());
+        let since = *self.since.get_or_insert(now);
+        if now - since < Duration::from_secs(1) {
+            return;
+        }
+        let skipped_shader = waits.0 - self.waits_at.0;
+        let skipped_pipeline = waits.1 - self.waits_at.1;
+        if skipped_shader + skipped_pipeline > 0 || self.worst_frame >= Self::SLOW_FRAME {
+            tracing::info!(
+                skipped_shader,
+                skipped_pipeline,
+                worst_frame_ms = self.worst_frame.as_secs_f32() * 1000.0,
+                presents = self.presents,
+                seconds = (now - since).as_secs_f32(),
+                translating = shaders.translating(),
+                building = pipelines.building(),
+                "draw stalls"
+            );
+        }
+        *self = Self {
+            since: Some(now),
+            last_present: Some(now),
+            waits_at: waits,
+            ..Self::default()
+        };
+    }
 }
 
 /// Graphics settings the frontend changes while a renderer runs. A renderer that
@@ -109,12 +161,27 @@ pub struct VulkanRasterizer {
     fences: VecDeque<(u64, Release)>,
     samples: samples::SampleCounter,
     unflushed: bool,
-    texture_cache: TextureCache,
-    buffer_cache: BufferCache,
+    texture_cache: ManuallyDrop<TextureCache>,
+    buffer_cache: ManuallyDrop<BufferCache>,
     draw: draw::DrawState,
     live: Option<Arc<LiveSettings>>,
     activity: Activity,
+    stalls: Stalls,
     frame_dump: Option<frame_dump::FrameDump>,
+    teardown: Teardown,
+}
+
+/// The threads freeing the caches when the renderer drops, joined after every other field.
+struct Teardown(Vec<std::thread::JoinHandle<()>>);
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        for thread in self.0.drain(..) {
+            if thread.join().is_err() {
+                tracing::error!("a renderer teardown thread panicked");
+            }
+        }
+    }
 }
 
 /// Work that runs once the host GPU finished everything recorded before it.
@@ -267,24 +334,28 @@ impl VulkanRasterizer {
         scheduler.time_waits(handles.activity.clone());
         let pipelines = PipelineCache::new(device, &GraphicsSettings::default(), None, None)?;
         let draw = draw::DrawState::new(device, pipelines, gob_layout, scheduler.record()?)?;
+        let staging = StagingRing::new(device, 32 << 20)?;
+        let samples = samples::SampleCounter::new(device)?;
         Ok(Self {
-            buffer_cache,
+            buffer_cache: ManuallyDrop::new(buffer_cache),
             draw,
             device: device.clone(),
             handles,
             scheduler,
-            staging: StagingRing::new(device, 32 << 20)?,
+            staging,
             frame_uploads: Vec::new(),
             mailbox,
             gob_layout,
             frames: Vec::new(),
             fences: VecDeque::new(),
-            samples: samples::SampleCounter::new(device)?,
+            samples,
             unflushed: true,
-            texture_cache,
+            texture_cache: ManuallyDrop::new(texture_cache),
             live: None,
             activity: Activity::default(),
+            stalls: Stalls::default(),
             frame_dump: frame_dump::FrameDump::from_env(),
+            teardown: Teardown(Vec::new()),
         })
     }
 
@@ -1240,9 +1311,13 @@ impl Rasterizer for VulkanRasterizer {
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
         self.activity.presents += 1;
+        let now = Instant::now();
+        self.stalls
+            .present(now, &self.draw.shaders, &self.draw.pipelines);
         self.handles.timestamp.frame_presented();
         self.draw.shaders.flush_disk();
-        self.draw.shaders.log_stats(Instant::now());
+        self.draw.pipelines.autosave(now);
+        self.draw.shaders.log_stats(now);
         self.draw.shaders.end_frame();
         for pipeline in self.draw.pipelines.replaced() {
             self.scheduler.retire(pipeline);
@@ -1293,10 +1368,33 @@ impl Rasterizer for VulkanRasterizer {
 }
 
 impl Drop for VulkanRasterizer {
+    /// Waits for the GPU, then frees the texture and buffer caches on their own threads while
+    /// the other fields drop on this one.
     fn drop(&mut self) {
-        let _ = self.scheduler.finish();
+        if self.scheduler.finish().is_err() {
+            self.device.wait_idle();
+        }
         self.draw.destroy(&self.device);
         self.samples.destroy(&self.device);
+        // SAFETY: each field is taken once, here, and never used again; the GPU is idle.
+        let (texture_cache, buffer_cache) = unsafe {
+            (
+                ManuallyDrop::take(&mut self.texture_cache),
+                ManuallyDrop::take(&mut self.buffer_cache),
+            )
+        };
+        let spawn = |free: Box<dyn FnOnce() + Send>| {
+            std::thread::Builder::new()
+                .name("gpu-teardown".into())
+                .spawn(free)
+                .ok()
+        };
+        self.teardown
+            .0
+            .extend(spawn(Box::new(move || drop(texture_cache))));
+        self.teardown
+            .0
+            .extend(spawn(Box::new(move || drop(buffer_cache))));
     }
 }
 

@@ -10,7 +10,7 @@ const fn field(word: u32, low: u32, bits: u32) -> u8 {
 }
 
 /// `VFPExpandImm`: the S or D value of an 8-bit FP immediate.
-fn expand_imm(fp: Fp, imm8: u8) -> u64 {
+pub(super) fn expand_imm(fp: Fp, imm8: u8) -> u64 {
     let (sign, b, low) = (imm8 as u64 >> 7, imm8 as u64 >> 6 & 1, imm8 as u64 & 0x3f);
     match fp {
         Fp::S => sign << 31 | (b ^ 1) << 30 | (b * 0x1f) << 25 | low << 19,
@@ -64,6 +64,15 @@ pub(in super::super) fn lower(t: &mut Translator, word: u32) -> bool {
         }
         _ => {}
     }
+    if matches!(
+        word & 0xff3f_fc00,
+        0x1e24_4000 | 0x1e24_c000 | 0x1e25_4000 | 0x1e25_c000 | 0x1e26_4000
+    ) && t.sse41
+    {
+        let a = vec(t, rn);
+        set_vec(t, SimdOp::RoundInt { fp, a, word });
+        return true;
+    }
     let wide = word >> 31 != 0;
     if word & 0xdfbf_fc00 == 0x5e21_d800 {
         let v = vec(t, rn);
@@ -96,7 +105,10 @@ pub(in super::super) fn lower(t: &mut Translator, word: u32) -> bool {
             );
             return true;
         }
-        0x1e38_0000 | 0x1e39_0000 => {
+        0x1e38_0000 | 0x1e39_0000 | 0x1e20_0000 | 0x1e21_0000 | 0x1e28_0000 | 0x1e29_0000
+        | 0x1e30_0000 | 0x1e31_0000 | 0x1e24_0000 | 0x1e25_0000
+            if word & 0x0018_0000 == 0x0018_0000 || t.sse41 =>
+        {
             let a = vec(t, rn);
             let signed = word & 0x1_0000 == 0;
             let r = t.op(Op::Simd(SimdOp::ToInt {
