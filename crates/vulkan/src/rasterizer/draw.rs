@@ -632,6 +632,7 @@ impl VulkanRasterizer {
                 .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST),
         };
         if !self.graphics_stages(ctx, host_topology) {
+            self.diag_skip(ctx, "shader");
             return Ok(());
         }
         {
@@ -680,6 +681,7 @@ impl VulkanRasterizer {
         let key = GraphicsPipelineKey::new(&draw.stages, attachments, &fixed);
         let Some(pipeline) = draw.pipelines.graphics(&key, &draw.stages) else {
             diag::with(|d| d.finish("no-pipeline"));
+            self.diag_skip(ctx, "pipeline");
             return Ok(());
         };
         let pipeline_raw = pipeline.raw();

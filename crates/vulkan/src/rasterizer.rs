@@ -390,12 +390,12 @@ impl VulkanRasterizer {
     /// pipelines compile asynchronously.
     pub fn apply_settings(&mut self, settings: &GraphicsSettings) {
         self.draw.set_anisotropy(settings.anisotropic_filtering);
-        self.draw
-            .pipelines
-            .set_async_compilation(settings.async_shader_compilation);
+        self.draw.pipelines.set_async_compilation(
+            settings.async_shader_compilation && !draw::diag::sync_compile(),
+        );
         self.draw
             .shaders
-            .set_async(settings.async_shader_compilation);
+            .set_async(settings.async_shader_compilation && !draw::diag::sync_compile());
         self.draw
             .shaders
             .set_resolution_scale(settings.resolution_scale);

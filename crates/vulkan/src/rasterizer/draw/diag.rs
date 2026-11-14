@@ -40,6 +40,14 @@ fn flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
+pub(crate) fn skips() -> bool {
+    flag("LICHII_DIAG_SKIPS")
+}
+
+pub(crate) fn sync_compile() -> bool {
+    flag("LICHII_DIAG_SYNC_COMPILE")
+}
+
 pub(crate) fn init() {
     START.get_or_init(Instant::now);
     let _ = state();
@@ -51,6 +59,8 @@ pub(crate) fn init() {
         samples1 = samples1(),
         no_dual = no_dual(),
         no_cmask = no_cmask(),
+        skips = skips(),
+        sync_compile = sync_compile(),
         log = state().is_some(),
         "draw diag build"
     );
@@ -526,7 +536,8 @@ impl VulkanRasterizer {
             let mask = regs.color_mask[if regs.color_mask_common != 0 { 0 } else { i }];
             let _ = write!(
                 s,
-                " C{i}[rt{idx} fmt={:#x} {}x{} addr={:#x} host={:?} {}x{} blend={} mask={:#x}]",
+                " C{i}[id={:?} rt{idx} fmt={:#x} {}x{} addr={:#x} host={:?} {}x{} blend={} mask={:#x}]",
+                t.id,
                 rt.format,
                 rt.width,
                 rt.height,
@@ -591,6 +602,45 @@ impl VulkanRasterizer {
             }
         }
         super::diag::append(|l| l.push_str(&s));
+    }
+
+    pub(super) fn diag_skip(&self, ctx: &GraphicsContext<'_>, reason: &str) {
+        if !skips() {
+            return;
+        }
+        let regs = ctx.regs;
+        let mut s = format!("SKIP {reason}");
+        for m in self.draw.stages.iter().flatten() {
+            let _ = write!(s, " {:?}={:016x}", m.stage, m.hash);
+        }
+        let count = (regs.rt_control.count() as usize).min(8);
+        for i in 0..count {
+            let idx = render_target_index(regs, i);
+            let rt = &regs.rt[idx];
+            let id = (reason == "pipeline")
+                .then(|| self.draw.colors[i].map(|t| t.id))
+                .flatten();
+            let _ = write!(
+                s,
+                " C{i}[id={id:?} rt{idx} fmt={:#x} {}x{} addr={:#x}]",
+                rt.format,
+                rt.width,
+                rt.height,
+                rt.address()
+            );
+        }
+        if regs.zeta_enable != 0 {
+            let _ = write!(
+                s,
+                " Z[id={:?} fmt={:#x} addr={:#x}]",
+                (reason == "pipeline")
+                    .then(|| self.draw.depth.map(|t| t.id))
+                    .flatten(),
+                regs.zeta.format,
+                regs.zeta.address()
+            );
+        }
+        with(|d| d.always(&s));
     }
 
     pub(super) fn diag_texture(
