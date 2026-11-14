@@ -1,7 +1,7 @@
 //! Interpreter and JIT throughput on synthetic guest loops, in guest MIPS.
 //!
-//! `cargo bench -p lichii-cpu --bench cpu`; `LICHII_BENCH_ITERATIONS` sets the loop count
-//! (default 10M, zero is ignored).
+//! `cargo bench -p lichii-cpu --bench cpu [names...]`; `LICHII_BENCH_ITERATIONS` sets the loop
+//! count (default 10M, zero is ignored), and names run only the workloads containing one of them.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -162,6 +162,65 @@ const WORKLOADS: &[Workload] = &[
         ],
         far: &[],
         per_iteration: 12,
+    },
+    Workload {
+        name: "exact fp loop",
+        code: &[
+            0x1e2e1000, // fmov s0, #1.0
+            0x1e201001, // fmov s1, #2.0
+            0x1e2c1002, // fmov s2, #0.5
+            0x1e212803, // 1: fadd s3, s0, s1
+            0x1e210864, // fmul s4, s3, s1
+            0x1e203885, // fsub s5, s4, s0
+            0x1e2218a6, // fdiv s6, s5, s2
+            0x1e2288c7, // fnmul s7, s6, s2
+            0xbd000027, // str s7, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff21, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 8,
+    },
+    Workload {
+        name: "simd misc loop",
+        code: &[
+            0x1e2f1000, // fmov s0, #1.5
+            0x1e2e100a, // fmov s10, #1.0
+            0x1e21100b, // fmov s11, #3.0
+            0x1e2b194c, // fdiv s12, s10, s11
+            0x4e020023, // 1: tbl v3.16b, {v1.16b}, v2.16b
+            0x6ea54464, // ushl v4.4s, v3.4s, v5.4s
+            0x6ea08886, // cmge v6.4s, v4.4s, #0
+            0x6ea0f8c7, // fneg v7.4s, v6.4s
+            0x1e280008, // fcvtps w8, s0
+            0x8b080129, // add x9, x9, x8
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff21, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 8,
+    },
+    Workload {
+        name: "simd round loop",
+        code: &[
+            0x4f03f607, // fmov v7.4s, #1.0
+            0x1e6f1009, // fmov d9, #1.5
+            0x4ea29420, // 1: mla v0.4s, v1.4s, v2.4s
+            0x4f302403, // srshr v3.4s, v0.4s, #16
+            0x4f303464, // srsra v4.4s, v3.4s, #16
+            0x6e205885, // not v5.16b, v4.16b
+            0x4ea0c8e6, // fcmgt v6.4s, v7.4s, #0.0
+            0x1e664128, // frinta d8, d9
+            0x1e64012a, // fcvtas w10, d9
+            0x8b0a016b, // add x11, x11, x10
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffee1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
     },
     Workload {
         name: "exclusive pair loop",
@@ -537,8 +596,13 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or(10_000_000);
+    let names: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
     for ((workload, fpcr), backend) in WORKLOADS
         .iter()
+        .filter(|w| names.is_empty() || names.iter().any(|n| w.name.contains(n.as_str())))
         .flat_map(|w| {
             let fz = FLUSH_TO_ZERO.contains(&w.name).then_some((w, 1 << 24));
             std::iter::once((w, 0)).chain(fz)

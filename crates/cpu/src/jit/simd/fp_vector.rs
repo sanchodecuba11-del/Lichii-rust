@@ -15,6 +15,7 @@ use super::super::ir::{Loc, Op, Ty, Value};
 use super::super::translate::Translator;
 use super::super::x64::Emitter;
 use super::ir::{Fp, SimdOp};
+use super::vector::VecOp;
 use super::x64::Inputs;
 use crate::interpreter::simd::softfloat::{recip_estimate_u9, recip_sqrt_estimate_u9};
 
@@ -268,6 +269,35 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         0x2ea1_d800 => Some(LaneOp::RsqrtEstimate),
         _ => None,
     };
+    let zero_compare = match word & 0xbfbf_fc00 {
+        0x0ea0_c800 => Some((LaneOp::CompareGt, false)),
+        0x0ea0_d800 => Some((LaneOp::CompareEq, false)),
+        0x0ea0_e800 => Some((LaneOp::CompareGt, true)),
+        0x2ea0_c800 => Some((LaneOp::CompareGe, false)),
+        0x2ea0_d800 => Some((LaneOp::CompareGe, true)),
+        _ => None,
+    };
+    if let Some((op, swap)) = zero_compare {
+        if vector_lanes == 0 {
+            return false;
+        }
+        let (rd, rn) = (field(word, 0, 5), field(word, 5, 5));
+        let a = t.op(Op::Get(Loc::V(rn)));
+        let zero = t.op(Op::Simd(SimdOp::Vec(VecOp::Imm(0, true))));
+        let (n, m) = if swap { (zero, a) } else { (a, zero) };
+        let r = t.op(Op::Simd(SimdOp::Lanes(Lanes {
+            op,
+            fp,
+            lanes: vector_lanes,
+            n,
+            m,
+            index: None,
+            acc: None,
+            word,
+        })));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
     let (op, element, lanes) = if word & 0xbfbf_fc00 == 0x2ea1_f800 {
         (LaneOp::Sqrt, false, vector_lanes)
     } else if let Some(op) = unary(word & 0xbfff_fc00) {

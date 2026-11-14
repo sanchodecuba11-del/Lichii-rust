@@ -14,7 +14,9 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use super::super::ir::{Loc, Ty, Value};
-use super::super::x64::{CTX_FPCR, CTX_FPSR, CTX_PSTATE, Emitter, loc_offset};
+use super::super::x64::{
+    CTX_FPCR, CTX_FPSR, CTX_PSTATE, Emitter, ST_SCRATCH, ST_SCRATCH2, loc_offset,
+};
 use super::ir::{Arith, Fp, Fused, SimdOp};
 
 /// FPCR.RMode.
@@ -39,6 +41,18 @@ static HALF_SCALE: HalfScale = HalfScale([0x7780_0000, 0, 0, 0x7ef0_0000]);
 pub(in super::super) struct State {
     slow: Vec<Slow>,
     flush: Vec<Flush>,
+    exact: Vec<Exact>,
+}
+
+/// The out-of-line check of an arithmetic op that ran while FPSR.IXC was clear: it sets IXC when
+/// the op's result, whose bits are in `rax`, is not the exact value of `a op b`.
+struct Exact {
+    label: DynamicLabel,
+    resume: DynamicLabel,
+    op: Arith,
+    fp: Fp,
+    a: u8,
+    b: u8,
 }
 
 /// The inputs of a checked op that FPCR.FZ changes. FZ flushes a subnormal input to zero and
@@ -417,7 +431,9 @@ impl Emitter<'_> {
                 let d = self.def(v);
                 let extreme = matches!(op, Arith::Max | Arith::Min);
                 let sum = matches!(op, Arith::Add | Arith::Sub);
-                let slow = self.checked(!extreme, Some(Inputs::scalar(fp, &[a, b], sum)));
+                let exact = sum || fp == Fp::S && !extreme;
+                let inputs = Inputs::scalar(fp, &[a, b], sum);
+                let slow = self.checked(!extreme && !exact, Some(inputs));
                 dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(a));
                 match (op, fp) {
                     (Arith::Max | Arith::Min, _) => self.min_max(op == Arith::Max, fp, a, b, slow),
@@ -437,6 +453,24 @@ impl Emitter<'_> {
                     Arith::Mul | Arith::Nmul => self.check_result(fp, true, (fp, &[a, b]), slow),
                     Arith::Div => self.check_result(fp, true, (fp, &[a]), slow),
                     Arith::Max | Arith::Min => self.low_to_rax(fp, 15),
+                }
+                if exact {
+                    let (label, resume) =
+                        (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; test BYTE [r15 + CTX_FPSR], IXC
+                        ; jz =>label
+                        ; =>resume
+                    );
+                    self.simd.exact.push(Exact {
+                        label,
+                        resume,
+                        op,
+                        fp,
+                        a,
+                        b,
+                    });
                 }
                 match (op, fp) {
                     (Arith::Nmul, Fp::S) => {
@@ -545,6 +579,29 @@ impl Emitter<'_> {
                 self.rax_to_low(fp, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
+            SimdOp::RoundInt { fp, a, word } => {
+                let a = self.reg(a);
+                let d = self.def(v);
+                let slow = self.checked(false, Some(Inputs::scalar(fp, &[a], false)));
+                match fp {
+                    Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss Rx(a), Rx(a)),
+                    Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd Rx(a), Rx(a)),
+                }
+                dynasm!(self.asm ; .arch x64 ; jp =>slow);
+                match word >> 15 & 7 {
+                    4 => self.round_away(fp, a),
+                    opcode => {
+                        let imm = [8, 10, 9, 11][opcode as usize];
+                        match fp {
+                            Fp::S => dynasm!(self.asm ; .arch x64 ; roundss xmm15, Rx(a), imm),
+                            Fp::D => dynasm!(self.asm ; .arch x64 ; roundsd xmm15, Rx(a), imm),
+                        }
+                    }
+                }
+                self.low_to_rax(fp, 15);
+                self.rax_to_low(fp, d);
+                self.finish_checked(i, slow, word, d, Ty::U128);
+            }
             SimdOp::Convert { fp, a, word } => {
                 let a = self.reg(a);
                 let d = self.def(v);
@@ -604,11 +661,26 @@ impl Emitter<'_> {
                 let a = self.reg(a);
                 let d = self.def(v);
                 let slow = self.checked(true, Some(Inputs::scalar(fp, &[a], false)));
+                let src = match word >> 19 & 3 {
+                    3 => a,
+                    0 if word & 1 << 18 != 0 => {
+                        self.round_away(fp, a);
+                        15
+                    }
+                    rmode => {
+                        let imm = [8, 10, 9][rmode as usize];
+                        match fp {
+                            Fp::S => dynasm!(self.asm ; .arch x64 ; roundss xmm15, Rx(a), imm),
+                            Fp::D => dynasm!(self.asm ; .arch x64 ; roundsd xmm15, Rx(a), imm),
+                        }
+                        15
+                    }
+                };
                 match (fp, signed && !wide) {
-                    (Fp::S, true) => dynasm!(self.asm ; .arch x64 ; cvttss2si eax, Rx(a)),
-                    (Fp::D, true) => dynasm!(self.asm ; .arch x64 ; cvttsd2si eax, Rx(a)),
-                    (Fp::S, false) => dynasm!(self.asm ; .arch x64 ; cvttss2si rax, Rx(a)),
-                    (Fp::D, false) => dynasm!(self.asm ; .arch x64 ; cvttsd2si rax, Rx(a)),
+                    (Fp::S, true) => dynasm!(self.asm ; .arch x64 ; cvttss2si eax, Rx(src)),
+                    (Fp::D, true) => dynasm!(self.asm ; .arch x64 ; cvttsd2si eax, Rx(src)),
+                    (Fp::S, false) => dynasm!(self.asm ; .arch x64 ; cvttss2si rax, Rx(src)),
+                    (Fp::D, false) => dynasm!(self.asm ; .arch x64 ; cvttsd2si rax, Rx(src)),
                 }
                 match (signed, wide) {
                     (true, false) => dynasm!(self.asm
@@ -682,8 +754,176 @@ impl Emitter<'_> {
         }
     }
 
+    /// `xmm15` = `a` rounded to an integer with ties away from zero: the truncation, plus one
+    /// with `a`'s sign when the dropped fraction `a - trunc(a)`, which is exact, is at least a
+    /// half. Infinities stay as they are; `a` must not be a NaN. Clobbers `rax`, `rcx` and the
+    /// state's scratch.
+    fn round_away(&mut self, fp: Fp, a: u8) {
+        let done = self.asm.new_dynamic_label();
+        match fp {
+            Fp::S => dynasm!(self.asm
+                ; .arch x64
+                ; roundss xmm15, Rx(a), 11
+                ; movss [r13 + ST_SCRATCH], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subss xmm15, [r13 + ST_SCRATCH]
+                ; movd eax, xmm15
+                ; movss xmm15, [r13 + ST_SCRATCH]
+                ; and eax, 0x7fff_ffff
+                ; cmp eax, 0x3f00_0000
+                ; jb =>done
+                ; movd ecx, Rx(a)
+                ; and ecx, 0x8000_0000u32 as i32
+                ; or ecx, 0x3f80_0000
+                ; mov [r13 + ST_SCRATCH + 4], ecx
+                ; addss xmm15, [r13 + ST_SCRATCH + 4]
+                ; =>done
+            ),
+            Fp::D => dynasm!(self.asm
+                ; .arch x64
+                ; roundsd xmm15, Rx(a), 11
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subsd xmm15, [r13 + ST_SCRATCH]
+                ; movq rax, xmm15
+                ; movsd xmm15, [r13 + ST_SCRATCH]
+                ; btr rax, 63
+                ; mov rcx, QWORD 0x3fe0_0000_0000_0000
+                ; cmp rax, rcx
+                ; jb =>done
+                ; movq rax, Rx(a)
+                ; shr rax, 63
+                ; shl rax, 63
+                ; mov rcx, QWORD 0x3ff0_0000_0000_0000
+                ; or rax, rcx
+                ; mov [r13 + ST_SCRATCH + 8], rax
+                ; addsd xmm15, [r13 + ST_SCRATCH + 8]
+                ; =>done
+            ),
+        }
+    }
+
+    /// Jumps to `e.resume` when the result bits in `rax` are the exact value of `a op b`, and
+    /// falls through when they are rounded. A sum's rounding error comes from 2Sum, which is exact
+    /// for finite results, so it is zero only for an exact sum. An S product or quotient is exact
+    /// when `a * b`, or `q * b` against `a`, matches in D, where the product of two S values is
+    /// exact. Clobbers `xmm15`, `rcx` and the state's scratch.
+    fn exactness(&mut self, e: &Exact) {
+        let (a, b) = (e.a, e.b);
+        match (e.op, e.fp) {
+            (Arith::Add, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; movd xmm15, eax
+                ; subss xmm15, Rx(a)
+                ; movss [r13 + ST_SCRATCH], xmm15
+                ; movd xmm15, eax
+                ; subss xmm15, [r13 + ST_SCRATCH]
+                ; movss [r13 + ST_SCRATCH + 4], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subss xmm15, [r13 + ST_SCRATCH + 4]
+                ; movss [r13 + ST_SCRATCH + 4], xmm15
+                ; movaps xmm15, Rx(b)
+                ; subss xmm15, [r13 + ST_SCRATCH]
+                ; addss xmm15, [r13 + ST_SCRATCH + 4]
+                ; movd ecx, xmm15
+                ; add ecx, ecx
+                ; jz =>e.resume
+            ),
+            (Arith::Add, Fp::D) => dynasm!(self.asm
+                ; .arch x64
+                ; movq xmm15, rax
+                ; subsd xmm15, Rx(a)
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; movq xmm15, rax
+                ; subsd xmm15, [r13 + ST_SCRATCH]
+                ; movsd [r13 + ST_SCRATCH + 8], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subsd xmm15, [r13 + ST_SCRATCH + 8]
+                ; movsd [r13 + ST_SCRATCH + 8], xmm15
+                ; movaps xmm15, Rx(b)
+                ; subsd xmm15, [r13 + ST_SCRATCH]
+                ; addsd xmm15, [r13 + ST_SCRATCH + 8]
+                ; movq rcx, xmm15
+                ; add rcx, rcx
+                ; jz =>e.resume
+            ),
+            (Arith::Sub, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; mov [r13 + ST_SCRATCH2], eax
+                ; movaps xmm15, Rx(a)
+                ; subss xmm15, [r13 + ST_SCRATCH2]
+                ; movss [r13 + ST_SCRATCH], xmm15
+                ; movd xmm15, eax
+                ; addss xmm15, [r13 + ST_SCRATCH]
+                ; movss [r13 + ST_SCRATCH + 4], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subss xmm15, [r13 + ST_SCRATCH + 4]
+                ; movss [r13 + ST_SCRATCH + 4], xmm15
+                ; movss xmm15, [r13 + ST_SCRATCH]
+                ; subss xmm15, Rx(b)
+                ; addss xmm15, [r13 + ST_SCRATCH + 4]
+                ; movd ecx, xmm15
+                ; add ecx, ecx
+                ; jz =>e.resume
+            ),
+            (Arith::Sub, Fp::D) => dynasm!(self.asm
+                ; .arch x64
+                ; mov [r13 + ST_SCRATCH2], rax
+                ; movaps xmm15, Rx(a)
+                ; subsd xmm15, [r13 + ST_SCRATCH2]
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; movq xmm15, rax
+                ; addsd xmm15, [r13 + ST_SCRATCH]
+                ; movsd [r13 + ST_SCRATCH + 8], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subsd xmm15, [r13 + ST_SCRATCH + 8]
+                ; movsd [r13 + ST_SCRATCH + 8], xmm15
+                ; movsd xmm15, [r13 + ST_SCRATCH]
+                ; subsd xmm15, Rx(b)
+                ; addsd xmm15, [r13 + ST_SCRATCH + 8]
+                ; movq rcx, xmm15
+                ; add rcx, rcx
+                ; jz =>e.resume
+            ),
+            (Arith::Mul | Arith::Nmul, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; cvtss2sd xmm15, Rx(b)
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; cvtss2sd xmm15, Rx(a)
+                ; mulsd xmm15, [r13 + ST_SCRATCH]
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; movd xmm15, eax
+                ; cvtss2sd xmm15, xmm15
+                ; ucomisd xmm15, [r13 + ST_SCRATCH]
+                ; je =>e.resume
+            ),
+            (Arith::Div, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; cvtss2sd xmm15, Rx(b)
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; movd xmm15, eax
+                ; cvtss2sd xmm15, xmm15
+                ; mulsd xmm15, [r13 + ST_SCRATCH]
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; cvtss2sd xmm15, Rx(a)
+                ; ucomisd xmm15, [r13 + ST_SCRATCH]
+                ; je =>e.resume
+            ),
+            _ => unreachable!("only sums and S products and quotients are checked for exactness"),
+        }
+    }
+
     /// Emits the slow paths and FZ input checks of every checked op in the block.
     pub(in super::super) fn simd_slow_paths(&mut self) {
+        for exact in std::mem::take(&mut self.simd.exact) {
+            dynasm!(self.asm ; .arch x64 ; =>exact.label);
+            self.exactness(&exact);
+            dynasm!(self.asm
+                ; .arch x64
+                ; or BYTE [r15 + CTX_FPSR], IXC
+                ; jmp =>exact.resume
+            );
+        }
         for flush in std::mem::take(&mut self.simd.flush) {
             dynasm!(self.asm
                 ; .arch x64

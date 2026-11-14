@@ -466,6 +466,7 @@ impl Machine {
                 let mut jit = Jit::new(config).unwrap();
                 jit.target.sse41 = false;
                 jit.target.sse42 = false;
+                jit.target.avx2 = false;
                 Box::new(jit)
             }
         };
@@ -828,7 +829,12 @@ fn simd_runs_mid_block_on_the_live_context() {
 /// FPSR.IXC both clear and already set.
 #[test]
 fn fp_edge_cases_match_the_interpreter() {
-    const OPS: [u32; 26] = [
+    const OPS: [u32; 37] = [
+        0x1e24_4020, // frintn s0, s1
+        0x1e24_c020, // frintp s0, s1
+        0x1e25_4020, // frintm s0, s1
+        0x1e25_c020, // frintz s0, s1
+        0x1e26_4020, // frinta s0, s1
         0x1e22_4820, // fmax s0, s1, s2
         0x1e22_5820, // fmin s0, s1, s2
         0x1e22_6820, // fmaxnm s0, s1, s2
@@ -855,11 +861,18 @@ fn fp_edge_cases_match_the_interpreter() {
         0x1e22_1425, // fccmp s1, s2, #5, ne
         0x1e22_0435, // fccmpe s1, s2, #5, eq
         0x1e22_1435, // fccmpe s1, s2, #5, ne
+        0x1e20_0020, // fcvtns w0, s1
+        0x1e28_0020, // fcvtps w0, s1
+        0x1e30_0020, // fcvtms w0, s1
+        0x1e29_0020, // fcvtpu w0, s1
+        0x9e30_0020, // fcvtms x0, s1
+        0x9e21_0020, // fcvtnu x0, s1
     ];
     let machines = &mut [
         ("interpreter", Machine::new(Backend::Interpreter)),
         ("jit", Machine::new(Backend::Jit(Passes::ALL))),
         ("jit without fma", Machine::new(Backend::NoFma)),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
     ];
     let data = vec![0u8; DATA_SIZE as usize];
     let fpcrs = [0, 1 << 24, 1 << 25, 3 << 22];
@@ -2010,7 +2023,7 @@ fn run_profiled(
 
 /// A scalar product, fused product, quotient or narrowing conversion whose result is zero because a
 /// factor, the dividend or the source is zero stays native; an underflow to zero still falls back, and an inexact op with
-/// FPSR.IXC clear is counted apart from it.
+/// FPSR.IXC clear that has no native exactness check is counted apart from it.
 #[test]
 fn zero_factor_products_stay_native() {
     const PROGRAM: [u32; 10] = [
@@ -2022,7 +2035,7 @@ fn zero_factor_products_stay_native() {
         0x1e6d_098a, // fmul d10, d12, d13
         0x1e27_08e6, // fmul s6, s7, s7
         0xd51b_443f, // msr fpsr, xzr
-        0x1e29_0848, // fmul s8, s2, s9
+        0x1e21_c128, // fsqrt s8, s9
         BRK,
     ];
     let mut ctx = ThreadContext {
@@ -2050,7 +2063,7 @@ fn zero_factor_products_stay_native() {
             "native FP slow paths, inputs or result: {}\n",
             1 + fused_slow
         ),
-        "FP 2-source 0x1e200800".to_string(),
+        "FP 1-source 0x1e21c000".to_string(),
     ] {
         assert!(table.contains(&line), "{line:?} in\n{table}");
     }
@@ -2784,4 +2797,350 @@ fn cores_sharing_code_read_their_own_tsc_scale() {
     assert_eq!(run_to_brk(&mut cores[0])[0], 12345);
     assert_eq!(run_to_brk(&mut cores[1])[0], 67890);
     assert!(cores[1].cache.adopted() > 0);
+}
+
+/// While FPSR.IXC is clear, scalar sums and S products and quotients stay native and set IXC
+/// exactly when their result is rounded. Small integers, powers of two and scaled integers make
+/// many results exact; random bits make most of them rounded.
+#[test]
+fn ixc_clear_arithmetic_sets_ixc_only_for_rounded_results() {
+    const OPS: [u32; 9] = [
+        0x1e22_2820, // fadd s0, s1, s2
+        0x1e22_3820, // fsub s0, s1, s2
+        0x1e22_0820, // fmul s0, s1, s2
+        0x1e22_1820, // fdiv s0, s1, s2
+        0x1e22_8820, // fnmul s0, s1, s2
+        0x1e62_2820, // fadd d0, d1, d2
+        0x1e62_3820, // fsub d0, d1, d2
+        0x1e62_0820, // fmul d0, d1, d2
+        0x1e62_1820, // fdiv d0, d1, d2
+    ];
+    let mut rng = Rng(0x1c5e_7a11_0dd5_eed5);
+    let mut value = |double: bool| {
+        let sign = if rng.below(2) == 0 { 1.0 } else { -1.0 };
+        let x = sign
+            * match rng.below(5) {
+                0 => rng.below(41) as f64,
+                1 if double => 2f64.powi(rng.below(2100) as i32 - 1076),
+                1 => 2f64.powi(rng.below(280) as i32 - 151),
+                2 => (rng.below(1 << 20) as f64) * 2f64.powi(rng.below(60) as i32 - 30),
+                3 => 1.0 + 2f64.powi(-(rng.below(60) as i32)),
+                _ if double => f64::from_bits(rng.next() >> 2),
+                _ => f32::from_bits(rng.next() as u32 >> 2) as f64,
+            };
+        if double {
+            x.to_bits() as u128
+        } else {
+            (x as f32).to_bits() as u128
+        }
+    };
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without fma", Machine::new(Backend::NoFma)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for i in 0..30_000 {
+        let op = OPS[i % OPS.len()];
+        let double = op & 1 << 22 != 0;
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            fpcr: if i % 4 == 3 { 1 << 24 } else { 0 },
+            ..Default::default()
+        };
+        ctx.v[1] = value(double);
+        ctx.v[2] = value(double);
+        compare(machines, &[op, BRK], &ctx, &data);
+    }
+    let program = [
+        0xd51b_443f,
+        OPS[0],
+        OPS[1],
+        OPS[2],
+        OPS[3],
+        OPS[4],
+        OPS[5],
+        OPS[6],
+        BRK,
+    ];
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        fpsr: 0x10,
+        ..Default::default()
+    };
+    ctx.v[1] = 3.0f32.to_bits() as u128;
+    ctx.v[2] = 0.1f32.to_bits() as u128;
+    let (halt, after, table) = run_profiled(&program, ctx, true);
+    assert_eq!(halt, HaltReason::Breakpoint(0));
+    assert_eq!(after.fpsr & 0x10, 0x10);
+    let table = table.unwrap();
+    assert!(!table.contains("FPSR.IXC clear"), "{table}");
+}
+
+/// `FCVTNS`, `FCVTPS`, `FCVTMS`, `FCVTAS` and the unsigned forms, and `FRINTN`/`P`/`M`/`Z`/`A`,
+/// round halves, near-integers and values at the edges of the W and X ranges exactly as the
+/// interpreter does, natively when the host has SSE4.1.
+#[test]
+fn rounding_conversions_match_the_interpreter() {
+    const OPS: [u32; 21] = [
+        0x1e24_0020, // fcvtas w0, s1
+        0x1e25_0020, // fcvtau w0, s1
+        0x9e24_0020, // fcvtas x0, s1
+        0x9e25_0020, // fcvtau x0, s1
+        0x1e24_4020, // frintn s0, s1
+        0x1e24_c020, // frintp s0, s1
+        0x1e25_4020, // frintm s0, s1
+        0x1e25_c020, // frintz s0, s1
+        0x1e26_4020, // frinta s0, s1
+        0x1e20_0020, // fcvtns w0, s1
+        0x1e21_0020, // fcvtnu w0, s1
+        0x1e28_0020, // fcvtps w0, s1
+        0x1e29_0020, // fcvtpu w0, s1
+        0x1e30_0020, // fcvtms w0, s1
+        0x1e31_0020, // fcvtmu w0, s1
+        0x9e20_0020, // fcvtns x0, s1
+        0x9e21_0020, // fcvtnu x0, s1
+        0x9e28_0020, // fcvtps x0, s1
+        0x9e29_0020, // fcvtpu x0, s1
+        0x9e30_0020, // fcvtms x0, s1
+        0x9e31_0020, // fcvtmu x0, s1
+    ];
+    let mut values: Vec<f64> = (-20..=20).map(|k| f64::from(k) * 0.5).collect();
+    values.extend([0.49999997, -0.49999997, 1.0000001, -2.9999998, 1e-3, -1e-3]);
+    values.extend([
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        1e-310,
+        -1e-40,
+    ]);
+    values.extend([
+        0.49999999999999994,
+        -0.49999999999999994,
+        4503599627370497.0,
+        8388609.0,
+    ]);
+    values.extend([
+        8388608.5,
+        -8388607.5,
+        2251799813685248.5,
+        -4503599627370495.5,
+    ]);
+    for edge in [2f64.powi(31), 2f64.powi(32), 2f64.powi(63), 2f64.powi(64)] {
+        values.extend([edge, -edge, edge - 0.5, edge - 1.0, edge - 1.5, 1.0 - edge]);
+    }
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for op in OPS {
+        for double in [false, true] {
+            for &x in &values {
+                for fpsr in [0, 0x10] {
+                    let mut ctx = ThreadContext {
+                        pc: CODE,
+                        fpsr,
+                        ..Default::default()
+                    };
+                    ctx.v[1] = match double {
+                        false => (x as f32).to_bits() as u128,
+                        true => x.to_bits() as u128,
+                    };
+                    let op = if double { op | 1 << 22 } else { op };
+                    compare(machines, &[op, BRK], &ctx, &data);
+                }
+            }
+        }
+    }
+}
+
+/// `TBL` with one register and `USHL` on S and D lanes against the interpreter: table indices
+/// below and above 16, and shift bytes from -70 to 70 (past the lane width both ways) as well as
+/// random ones, with random bits above each lane's low byte.
+#[test]
+fn table_lookups_and_register_shifts_match_the_interpreter() {
+    const OPS: [u32; 5] = [
+        0x0e02_0020, // tbl v0.8b, {v1.16b}, v2.8b
+        0x4e02_0020, // tbl v0.16b, {v1.16b}, v2.16b
+        0x2ea2_4420, // ushl v0.2s, v1.2s, v2.2s
+        0x6ea2_4420, // ushl v0.4s, v1.4s, v2.4s
+        0x6ee2_4420, // ushl v0.2d, v1.2d, v2.2d
+    ];
+    let mut rng = Rng(0x7ab1_e5e1_f7ed_0042);
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for i in 0..6000 {
+        let op = OPS[i % OPS.len()];
+        let bytes: [u8; 16] = std::array::from_fn(|_| match rng.below(4) {
+            0 => rng.below(16) as u8,
+            1 => (rng.below(141) as i32 - 70) as u8,
+            _ => rng.next() as u8,
+        });
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        ctx.v[0] = u128::from(rng.next()) << 64 | u128::from(rng.next());
+        ctx.v[1] = u128::from(rng.next()) << 64 | u128::from(rng.next());
+        ctx.v[2] = u128::from_le_bytes(bytes);
+        compare(machines, &[op, BRK], &ctx, &data);
+    }
+}
+
+/// Integer compares against zero (`CMGT`, `CMGE`, `CMEQ`, `CMLE`, `CMLT`) on every arrangement, and
+/// vector `FNEG`/`FABS` on S and D lanes, NaNs included, against the interpreter.
+#[test]
+fn zero_compares_and_sign_ops_match_the_interpreter() {
+    let mut ops = Vec::new();
+    for base in [
+        0x0e20_8820,
+        0x2e20_8820,
+        0x0e20_9820,
+        0x2e20_9820,
+        0x0e20_a820,
+    ] {
+        for size in 0..4 {
+            for q in [0, 1 << 30] {
+                if size < 3 || q != 0 {
+                    ops.push(base | size << 22 | q);
+                }
+            }
+        }
+    }
+    for base in [0x0ea0_f820, 0x2ea0_f820] {
+        ops.extend([base, base | 1 << 30, base | 1 << 30 | 1 << 22]);
+    }
+    let mut rng = Rng(0x2e20_8820_0ea0_f820);
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for i in 0..4000 {
+        let lane = |rng: &mut Rng| match rng.below(4) {
+            0 => 0,
+            1 => rng.interesting(),
+            _ => rng.next(),
+        };
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        ctx.v[0] = u128::from(rng.next()) << 64 | u128::from(rng.next());
+        ctx.v[1] = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        compare(machines, &[ops[i % ops.len()], BRK], &ctx, &data);
+    }
+}
+
+/// Vector `MLA`/`MLS` on H and S lanes, `NOT`, `FMOV` (vector, immediate) and the FP compares
+/// against zero against the interpreter, with NaN, zero, subnormal and normal lanes under FZ on
+/// and off.
+#[test]
+fn multiply_accumulate_not_fmov_and_fp_zero_compares_match_the_interpreter() {
+    let mut ops = Vec::new();
+    for base in [0x0e62_9420u32, 0x2e62_9420] {
+        for size in 1..3 {
+            ops.extend([
+                base & !(3 << 22) | size << 22,
+                base & !(3 << 22) | size << 22 | 1 << 30,
+            ]);
+        }
+    }
+    ops.extend([0x2e20_5820, 0x6e20_5820]);
+    for base in [
+        0x0ea0_c820,
+        0x0ea0_d820,
+        0x0ea0_e820,
+        0x2ea0_c820,
+        0x2ea0_d820,
+    ] {
+        ops.extend([base, base | 1 << 30, base | 1 << 30 | 1 << 22]);
+    }
+    let mut rng = Rng(0x0e62_9420_2ea0_d820);
+    for _ in 0..8 {
+        let imm8 = rng.below(256) as u32;
+        let (abc, defgh) = (imm8 >> 5, imm8 & 31);
+        let fmov = 0x0f00_f400 | abc << 16 | defgh << 5;
+        ops.extend([fmov, fmov | 1 << 30, fmov | 3 << 29]);
+    }
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    let lane = |rng: &mut Rng| -> u64 {
+        let s = |rng: &mut Rng| match rng.below(6) {
+            0 => 0,
+            1 => 0x8000_0000,
+            2 => FP_S[rng.below(FP_S.len() as u64) as usize] as u64,
+            3 => rng.below(0x0080_0000) | (rng.below(2) << 31),
+            _ => rng.next() & 0xffff_ffff,
+        };
+        match rng.below(3) {
+            0 => FP_D[rng.below(FP_D.len() as u64) as usize],
+            _ => s(rng) << 32 | s(rng),
+        }
+    };
+    for i in 0..12_000 {
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            fpcr: if i % 3 == 0 { 1 << 24 } else { 0 },
+            fpsr: if i % 2 == 0 { 0x10 } else { 0 },
+            ..Default::default()
+        };
+        for v in &mut ctx.v[..3] {
+            *v = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        }
+        compare(machines, &[ops[i % ops.len()], BRK], &ctx, &data);
+    }
+}
+
+/// `SRSHR`, `URSHR`, `SRSRA` and `URSRA` on H, S and (unsigned) D lanes, by every amount from 1
+/// to the lane width, against the interpreter.
+#[test]
+fn rounding_shifts_match_the_interpreter() {
+    let mut ops = Vec::new();
+    for (opcode, u) in [(0b00100, 0), (0b00100, 1), (0b00110, 0), (0b00110, 1)] {
+        for size in 1..4u32 {
+            let esize = 8 << size;
+            for shift in 1..=esize {
+                for q in [0, 1] {
+                    if size == 3 && (q == 0 || u == 0) {
+                        continue;
+                    }
+                    let immhb = 2 * esize - shift;
+                    ops.push(0x0f00_0420 | q << 30 | u << 29 | immhb << 16 | opcode << 11);
+                }
+            }
+        }
+    }
+    let mut rng = Rng(0x0f00_0420_5257_5348);
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for &op in ops.iter().cycle().take(8 * ops.len()) {
+        let lane = |rng: &mut Rng| match rng.below(3) {
+            0 => rng.interesting(),
+            _ => rng.next(),
+        };
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        ctx.v[0] = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        ctx.v[1] = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        compare(machines, &[op, BRK], &ctx, &data);
+    }
 }

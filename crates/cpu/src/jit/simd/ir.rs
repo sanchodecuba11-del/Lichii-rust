@@ -79,6 +79,12 @@ pub enum SimdOp {
         a: Value,
         word: u32,
     },
+    /// `FRINTN`, `FRINTP`, `FRINTM`, `FRINTZ` or `FRINTA`, as `word`'s opcode says.
+    RoundInt {
+        fp: Fp,
+        a: Value,
+        word: u32,
+    },
     /// `FCVT` from H to S or D; `fp` is the destination size.
     FromHalf {
         fp: Fp,
@@ -99,7 +105,9 @@ pub enum SimdOp {
         x: Value,
         word: u32,
     },
-    /// `FCVTZS`/`FCVTZU` to a W (`wide` false) or X register, zero-extended.
+    /// `FCVTZS`/`FCVTZU` to a W (`wide` false) or X register, zero-extended; also `FCVTNS`,
+    /// `FCVTPS`, `FCVTMS`, `FCVTAS` and their unsigned forms, which round as `word`'s RMode
+    /// field (and, for `FCVTAS`, its opcode) says first.
     ToInt {
         fp: Fp,
         signed: bool,
@@ -160,6 +168,7 @@ impl SimdOp {
             SimdOp::Arith { word, .. }
             | SimdOp::Fused { word, .. }
             | SimdOp::Sqrt { word, .. }
+            | SimdOp::RoundInt { word, .. }
             | SimdOp::Convert { word, .. }
             | SimdOp::FromHalf { word, .. }
             | SimdOp::FromInt { word, .. }
@@ -184,6 +193,7 @@ impl SimdOp {
             | SimdOp::Abs(_, a)
             | SimdOp::Neg(_, a)
             | SimdOp::Sqrt { a, .. }
+            | SimdOp::RoundInt { a, .. }
             | SimdOp::Convert { a, .. }
             | SimdOp::FromHalf { a, .. }
             | SimdOp::FromInt { x: a, .. }
