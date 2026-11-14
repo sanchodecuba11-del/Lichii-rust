@@ -2181,6 +2181,15 @@ mod tests {
             1,
             "a range already GPU-written arms nothing"
         );
+        f.cache.flush(&mut f.scheduler, DADDR, 0x2000).unwrap();
+        let before = allocations();
+        f.memory.arm_flush_traps(DADDR, 0x2000);
+        f.memory.disarm_flush_traps(DADDR, 0x2000);
+        assert_eq!(
+            allocations() - before,
+            0,
+            "arming and disarming again reuse their scratch"
+        );
         f.assert_no_validation_errors();
     }
 

@@ -4,7 +4,7 @@ use lichii_common::{DAddr, PAGE_MASK, PAGE_SIZE, PAddr, VAddr};
 use parking_lot::Mutex;
 
 use crate::page_table::{PageTable, no_trap};
-use crate::tracking::{CachedPages, FlushTrapHandler, ReverseMap};
+use crate::tracking::{CachedPages, FlushTrapHandler, PageFlags, ReverseMap};
 use crate::{AddressSpace, MemoryFault, MemoryPermission, PhysicalMemory};
 
 /// A device (SMMU) address space: guest memory as the GPU and other DMA engines see it.
@@ -24,6 +24,11 @@ pub struct DeviceAddressSpace {
     /// The handler [`DeviceAddressSpace::set_flush_trap_handler`] installed, for a process
     /// attached later; locked while either changes.
     flush_handler: Mutex<Option<Arc<dyn FlushTrapHandler>>>,
+    /// Device pages armed with [`DeviceAddressSpace::arm_flush_traps`] and not disarmed or
+    /// remapped since: a physical page stays trapped while any device page mapping it is armed.
+    armed: Arc<PageFlags>,
+    /// Scratch for the physical runs an arm or disarm passes on, used under `update`.
+    runs: Mutex<Vec<(PAddr, u64)>>,
 }
 
 impl DeviceAddressSpace {
@@ -35,6 +40,8 @@ impl DeviceAddressSpace {
             physical,
             process: OnceLock::new(),
             flush_handler: Mutex::new(None),
+            armed: Arc::new(PageFlags::new(1u64 << address_space_bits)),
+            runs: Mutex::new(Vec::new()),
         }
     }
 
@@ -62,29 +69,26 @@ impl DeviceAddressSpace {
     /// The physical pages behind the mapped pages of `[daddr, daddr + size)`, as runs.
     fn physical_runs(&self, daddr: DAddr, size: u64) -> Vec<(PAddr, u64)> {
         let mut runs: Vec<(PAddr, u64)> = Vec::new();
-        self.for_each_physical_page(daddr, size, |pa| {
-            match runs.last_mut() {
-                Some((start, len)) if *start + *len == pa => *len += PAGE_SIZE,
-                _ => runs.push((pa, PAGE_SIZE)),
-            }
+        self.for_each_page(daddr, size, |_, pa| {
+            push_page(&mut runs, pa);
             true
         });
         runs
     }
 
-    /// Calls `f` with the physical page behind each mapped page of `[daddr, daddr + size)`
+    /// Calls `f` with each mapped page of `[daddr, daddr + size)` and the physical page behind it
     /// until it returns false; returns whether it never did.
-    fn for_each_physical_page(
+    fn for_each_page(
         &self,
         daddr: DAddr,
         size: u64,
-        mut f: impl FnMut(PAddr) -> bool,
+        mut f: impl FnMut(DAddr, PAddr) -> bool,
     ) -> bool {
         let end = daddr.saturating_add(size);
         let mut page = daddr & !PAGE_MASK;
         while page < end {
             if let Some(pa) = self.physical_address(page)
-                && !f(pa)
+                && !f(page, pa)
             {
                 return false;
             }
@@ -102,22 +106,46 @@ impl DeviceAddressSpace {
         let Some(process) = self.process.get() else {
             return;
         };
-        if self.for_each_physical_page(daddr, size, |pa| process.is_trapped(pa)) {
+        if self.for_each_page(daddr, size, |page, pa| {
+            self.armed.test(page) && process.is_trapped(pa)
+        }) {
             return;
         }
-        process.arm_physical(&self.physical_runs(daddr, size));
+        let _reverse = self.update.lock();
+        let mut runs = self.runs.lock();
+        self.for_each_page(daddr, size, |page, pa| {
+            self.armed.set(page);
+            push_page(&mut runs, pa);
+            true
+        });
+        process.arm_physical(&runs);
+        runs.clear();
     }
 
-    /// Ends the flush traps of the physical pages behind `[daddr, daddr + size)`: the GPU wrote
-    /// its data there back to guest memory, or dropped it. Untrapped pages cost one flag test.
+    /// Ends the flush traps of the device pages of `[daddr, daddr + size)`: the GPU wrote its data
+    /// there back to guest memory, or dropped it. A physical page stays trapped while another
+    /// device page mapping it is still armed. Pages not armed cost one flag test.
     pub fn disarm_flush_traps(&self, daddr: DAddr, size: u64) {
         let Some(process) = self.process.get() else {
             return;
         };
-        if self.for_each_physical_page(daddr, size, |pa| !process.is_trapped(pa)) {
+        if self.for_each_page(daddr, size, |page, _| !self.armed.test(page)) {
             return;
         }
-        process.disarm_physical(&self.physical_runs(daddr, size));
+        let reverse = self.update.lock();
+        let mut runs = self.runs.lock();
+        self.for_each_page(daddr, size, |page, _| {
+            self.armed.clear(page);
+            true
+        });
+        self.for_each_page(daddr, size, |_, pa| {
+            if !any_armed(&reverse, &self.armed, pa) {
+                push_page(&mut runs, pa);
+            }
+            true
+        });
+        process.disarm_physical(&runs);
+        runs.clear();
     }
 
     /// Installs the handler that flush traps of the attached process, or of one attached later,
@@ -135,13 +163,14 @@ impl DeviceAddressSpace {
         };
         let sink = handler.map(|handler| {
             let reverse = self.update.clone();
+            let armed = self.armed.clone();
             Arc::new(move |pa: PAddr| {
                 let mut pages: Vec<DAddr> = Vec::new();
                 reverse.lock().for_each(pa, |daddr| pages.push(daddr));
                 for &daddr in &pages {
                     handler.flush_for_cpu(daddr, PAGE_SIZE);
                 }
-                !pages.is_empty()
+                any_armed(&reverse.lock(), &armed, pa)
             }) as crate::address_space::FlushSink
         });
         process.set_flush_sink(sink);
@@ -231,6 +260,7 @@ impl DeviceAddressSpace {
         if let Some(old) = self.physical_address(daddr) {
             reverse.remove(old, daddr);
         }
+        self.armed.clear(daddr);
         self.table.set(
             daddr,
             self.physical.pointer(pa),
@@ -287,6 +317,7 @@ impl DeviceAddressSpace {
             if let Some(old) = self.physical_address(addr) {
                 reverse.remove(old, addr);
             }
+            self.armed.clear(addr);
             self.table.clear(addr);
         }
     }
@@ -341,6 +372,21 @@ impl DeviceAddressSpace {
     pub fn fill(&self, daddr: DAddr, size: u64, byte: u8) -> Result<(), MemoryFault> {
         self.table.fill(daddr, size, byte, MemoryPermission::NONE)
     }
+}
+
+/// Adds physical page `pa` to `runs`, extending the last run when it follows it.
+fn push_page(runs: &mut Vec<(PAddr, u64)>, pa: PAddr) {
+    match runs.last_mut() {
+        Some((start, len)) if *start + *len == pa => *len += PAGE_SIZE,
+        _ => runs.push((pa, PAGE_SIZE)),
+    }
+}
+
+/// Whether a device page mapping physical page `pa` is armed.
+fn any_armed(reverse: &ReverseMap, armed: &PageFlags, pa: PAddr) -> bool {
+    let mut any = false;
+    reverse.for_each(pa, |daddr| any |= armed.test(daddr));
+    any
 }
 
 #[cfg(test)]

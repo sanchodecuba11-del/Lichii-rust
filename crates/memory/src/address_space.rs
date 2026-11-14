@@ -157,6 +157,8 @@ struct Tracking {
     reverse: ReverseMap,
     /// How many [`crate::CachedPages`] guards hold each physical page.
     cached: Box<[u16]>,
+    /// Scratch for the virtual pages a flush trap change updates.
+    pages: Vec<VAddr>,
 }
 
 impl Tracking {
@@ -164,6 +166,7 @@ impl Tracking {
         Self {
             reverse: ReverseMap::new(physical_size),
             cached: vec![0; (physical_size / PAGE_SIZE) as usize].into_boxed_slice(),
+            pages: Vec::new(),
         }
     }
 }
@@ -499,10 +502,10 @@ impl AddressSpace {
 
     /// Sets a flush trap on every physical page of `runs`, in every virtual page that maps one.
     pub(crate) fn arm_physical(&self, runs: &[(PAddr, u64)]) {
-        let tracking = self.update.lock();
+        let mut tracking = self.update.lock();
         #[cfg(test)]
         self.trap_updates.fetch_add(1, Ordering::Relaxed);
-        let mut pages = Vec::new();
+        let mut pages = std::mem::take(&mut tracking.pages);
         for &(pa, size) in runs {
             for page in (pa..pa + size).step_by(PAGE_SIZE as usize) {
                 if !self.trapped.test(page) {
@@ -512,14 +515,16 @@ impl AddressSpace {
             }
         }
         self.count_trap_update(&self.trap_stats.arms, &mut pages);
+        pages.clear();
+        tracking.pages = pages;
     }
 
     /// Removes the flush traps of the physical pages of `runs`.
     pub(crate) fn disarm_physical(&self, runs: &[(PAddr, u64)]) {
-        let tracking = self.update.lock();
+        let mut tracking = self.update.lock();
         #[cfg(test)]
         self.trap_updates.fetch_add(1, Ordering::Relaxed);
-        let mut pages = Vec::new();
+        let mut pages = std::mem::take(&mut tracking.pages);
         for &(pa, size) in runs {
             for page in (pa..pa + size).step_by(PAGE_SIZE as usize) {
                 if self.trapped.test(page) {
@@ -529,6 +534,8 @@ impl AddressSpace {
             }
         }
         self.count_trap_update(&self.trap_stats.disarms, &mut pages);
+        pages.clear();
+        tracking.pages = pages;
     }
 
     /// Brings `pages` in line with their trap flags and counts the change in `calls`.
