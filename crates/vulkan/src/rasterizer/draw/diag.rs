@@ -269,6 +269,37 @@ use lichii_texture::PixelFormat;
 
 const STATS_MAX_BYTES: u64 = 96 << 20;
 
+/// Level 0, layer 0 of a guest image as tightly packed rows, without row or GOB padding.
+fn level0(info: &crate::texture_cache::ImageInfo, bytes: &[u8]) -> Option<Vec<u8>> {
+    use crate::texture_cache::GuestLayout;
+    let bpp = info.format.bytes_per_block() as usize;
+    match info.layout {
+        GuestLayout::Pitch { pitch } => {
+            let row = info.width.div_ceil(info.format.block_width()) as usize * bpp;
+            let rows = info.height.div_ceil(info.format.block_height()) as usize;
+            let mut out = Vec::with_capacity(row * rows);
+            for r in 0..rows {
+                let start = r * pitch as usize;
+                out.extend_from_slice(bytes.get(start..start + row)?);
+            }
+            Some(out)
+        }
+        GuestLayout::BlockLinear { .. } => {
+            let surface = info.surface();
+            let tiling = surface.level_tiling(0);
+            let offset = surface.level_offset(0) as usize;
+            let tiled = bytes.get(offset..offset + tiling.size_bytes())?;
+            let mut out = vec![
+                0u8;
+                (tiling.width * tiling.height * tiling.depth * tiling.bytes_per_block)
+                    as usize
+            ];
+            lichii_texture::block_linear::unswizzle(&tiling, tiled, &mut out);
+            Some(out)
+        }
+    }
+}
+
 fn small_float(bits: u32, mantissa: u32, signed: bool) -> f32 {
     let sign = if signed && bits >> (mantissa + 5) & 1 != 0 {
         -1.0
@@ -435,7 +466,10 @@ impl VulkanRasterizer {
                 st.info.layers,
                 st.info.levels,
                 st.gpu_modified,
-                texel_stats(st.info.format, &bytes)
+                level0(&st.info, &bytes).map_or_else(
+                    || format!("all {}", texel_stats(st.info.format, &bytes)),
+                    |l0| format!("l0 {}", texel_stats(st.info.format, &l0))
+                )
             );
             log(&text);
         }
