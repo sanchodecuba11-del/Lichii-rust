@@ -864,6 +864,8 @@ pub struct PipelineCache {
     linking: HashMap<usize, Linking, FxBuildHasher>,
     /// Graphics lookups that found the pipeline still building, with nothing fast-linked yet.
     waits: u64,
+    /// [`Self::graphics_waiting`] lookups that waited for a pipeline still building.
+    blocked: u64,
     /// Pipeline count and driver compilations at the last [`Self::autosave`] write, or
     /// `None` when that write failed.
     saved: Option<(usize, u64)>,
@@ -988,6 +990,7 @@ impl PipelineCache {
             libraries: HashMap::default(),
             linking: HashMap::default(),
             waits: 0,
+            blocked: 0,
             saved: Some((0, 0)),
             next_save: None,
             save: Arc::new(AtomicU8::new(SAVE_IDLE)),
@@ -1038,6 +1041,40 @@ impl PipelineCache {
             return None;
         }
         self.ready(index)
+    }
+
+    /// As [`Self::graphics`], but a pipeline still building is waited for instead of skipped:
+    /// the fast-linked one once its libraries are built when the device links fast, else the
+    /// pipeline itself. `None` only when it failed to build.
+    pub fn graphics_waiting(
+        &mut self,
+        key: &GraphicsPipelineKey,
+        shaders: &GraphicsShaders,
+    ) -> Option<&Pipeline> {
+        let index = match self.graphics.get(key) {
+            Some(&index) => index,
+            None => self.insert_graphics(key, shaders, true),
+        };
+        if self.async_compile && self.slots[index].get().is_none() {
+            self.blocked += 1;
+            if self.ctx.features.fast_link && self.fast_linked(index, key, shaders).is_none() {
+                if let Some(Linking::Parts(parts, _)) = self.linking.get(&index) {
+                    for part in parts {
+                        part.wait();
+                    }
+                }
+                let _ = self.fast_linked(index, key, shaders);
+            }
+            if let Some(Linking::Linked(pipeline)) = self.linking.get(&index) {
+                return Some(pipeline);
+            }
+        }
+        self.slots[index].wait().as_ref()
+    }
+
+    /// Graphics lookups since the cache was created that waited for a pipeline still building.
+    pub fn blocked(&self) -> u64 {
+        self.blocked
     }
 
     /// Graphics lookups since the cache was created that found the pipeline still building.
@@ -2367,6 +2404,23 @@ mod tests {
         release.send(()).unwrap();
         drop(workers);
         assert_eq!(*order.lock(), ["library", "pipeline", "prebuild"]);
+    }
+
+    #[test]
+    fn waiting_lookups_return_a_pipeline_while_it_builds() {
+        let Some(device) = device() else { return };
+        let mut cache = PipelineCache::new(&device, &settings(true), None, None).unwrap();
+        let shaders = present_shaders();
+        let key = key(&cache, &Regs::with_defaults(), &shaders);
+        assert!(
+            cache.graphics_waiting(&key, &shaders).is_some(),
+            "fast-linked or built, never skipped"
+        );
+        assert_eq!((cache.blocked(), cache.waits()), (1, 0));
+        cache.wait_for_builds();
+        assert!(cache.graphics_waiting(&key, &shaders).is_some());
+        assert_eq!(cache.blocked(), 1, "a built pipeline needs no wait");
+        assert_eq!(device.instance().validation_errors(), 0);
     }
 
     #[test]
