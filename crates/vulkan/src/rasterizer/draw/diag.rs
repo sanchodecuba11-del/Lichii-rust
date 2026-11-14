@@ -122,7 +122,7 @@ pub(crate) fn watch_resolve(gmmu: &lichii_gpu::gmmu::Gmmu) {
             *dev = gmmu.translate(*gpu);
             if let Some(d) = *dev {
                 let text = format!("WATCH resolve gpu={gpu:#x} dev={d:#x}");
-                with(|s| s.event(&text));
+                with(|s| s.always(&text));
             }
         }
     }
