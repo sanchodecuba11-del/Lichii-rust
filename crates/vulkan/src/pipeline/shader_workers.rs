@@ -42,6 +42,40 @@ pub(crate) struct Job {
     pub scale: ResolutionScale,
     /// Whether to build the disk cache entry too.
     pub disk: bool,
+    pub queued: std::time::Instant,
+}
+
+pub(crate) mod diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static JOBS: AtomicU64 = AtomicU64::new(0);
+    pub static STALE: AtomicU64 = AtomicU64::new(0);
+    pub static TRANSLATE_SUM: AtomicU64 = AtomicU64::new(0);
+    pub static TRANSLATE_MAX: AtomicU64 = AtomicU64::new(0);
+    pub static WAIT_SUM: AtomicU64 = AtomicU64::new(0);
+    pub static WAIT_MAX: AtomicU64 = AtomicU64::new(0);
+    pub fn log() {
+        let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+        let jobs = take(&JOBS);
+        let stale = take(&STALE);
+        let (ts, tm, ws, wm) = (
+            take(&TRANSLATE_SUM),
+            take(&TRANSLATE_MAX),
+            take(&WAIT_SUM),
+            take(&WAIT_MAX),
+        );
+        if jobs + stale == 0 {
+            return;
+        }
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let n = jobs.max(1) as f64;
+        tracing::info!(
+            "shader worker diag: jobs={jobs} stale={stale} translate_avg_ms={:.2} translate_max_ms={:.2} wait_avg_ms={:.2} wait_max_ms={:.2}",
+            ms(ts) / n,
+            ms(tm),
+            ms(ws) / n,
+            ms(wm)
+        );
+    }
 }
 
 /// A finished job: `translated` is `None` when it went stale before a worker took it, or the
@@ -182,10 +216,20 @@ fn work(shared: &Shared, done: &mpsc::Sender<Done>, profile: &Profile, host: &Ho
                 shared.ready.wait(&mut queue);
             }
         };
+        let popped = std::time::Instant::now();
         let translated = if stale {
+            diag::STALE.fetch_add(1, Ordering::Relaxed);
             None
         } else {
-            translate(&job, profile, host)
+            let wait = (popped - job.queued).as_nanos() as u64;
+            let out = translate(&job, profile, host);
+            let took = popped.elapsed().as_nanos() as u64;
+            diag::JOBS.fetch_add(1, Ordering::Relaxed);
+            diag::TRANSLATE_SUM.fetch_add(took, Ordering::Relaxed);
+            diag::TRANSLATE_MAX.fetch_max(took, Ordering::Relaxed);
+            diag::WAIT_SUM.fetch_add(wait, Ordering::Relaxed);
+            diag::WAIT_MAX.fetch_max(wait, Ordering::Relaxed);
+            out
         };
         let finished = Done {
             key: job.key,

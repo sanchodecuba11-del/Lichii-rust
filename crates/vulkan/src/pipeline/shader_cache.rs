@@ -277,6 +277,7 @@ impl ShaderCache {
             disk_hits,
         } = self.stats;
         tracing::info!(translated, failed, hits, disk_hits, "shader cache");
+        super::shader_workers::diag::log();
         self.logged = (self.stats, Some(now));
         true
     }
@@ -491,6 +492,7 @@ impl ShaderCache {
             bindings,
             scale: self.scale,
             disk: self.disk.is_some(),
+            queued: std::time::Instant::now(),
         };
         workers.push(seen, job);
     }
