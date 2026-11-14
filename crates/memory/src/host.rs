@@ -229,6 +229,11 @@ impl Arena {
     /// Offsets of the trapped pages (capped at no access) that a change to the views over
     /// `[offset, offset + len)` would map accessible for a moment: none where views can be
     /// protected as they are mapped.
+    /// Whether a new view is accessible for a moment before its caps apply.
+    pub(crate) fn exposes_new_views(&self) -> bool {
+        sys::EXPOSES_NEW_VIEWS
+    }
+
     pub(crate) fn trapped_in_rebuilt_views(&self, offset: usize, len: usize) -> Vec<usize> {
         let restricted = self.restricted.lock();
         let mut trapped = Vec::new();
@@ -271,6 +276,9 @@ unsafe impl Sync for Arena {}
 
 #[cfg(unix)]
 mod sys {
+    /// Views are mapped with their final protection.
+    pub const EXPOSES_NEW_VIEWS: bool = false;
+
     use std::io;
 
     use super::{HostProtection, Restricted, protection_runs};
@@ -514,6 +522,9 @@ mod sys {
 
 #[cfg(windows)]
 mod sys {
+    /// Views are mapped read-write and protected afterwards.
+    pub const EXPOSES_NEW_VIEWS: bool = true;
+
     use std::collections::BTreeMap;
     use std::io;
     use std::sync::atomic::{AtomicU64, Ordering};

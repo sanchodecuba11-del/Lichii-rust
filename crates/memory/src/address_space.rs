@@ -217,7 +217,7 @@ impl AddressSpace {
         if let Err(err) = self.physical.commit(pa, size) {
             panic!("{err}");
         }
-        let mut tracking = self.lock_for_rebuild(va, size);
+        let mut tracking = self.lock_for_rebuild(va, size, Some(pa));
         let mut caps = Vec::new();
         for page in 0..size / PAGE_SIZE {
             let (addr, page_pa) = (va + page * PAGE_SIZE, pa + page * PAGE_SIZE);
@@ -250,7 +250,7 @@ impl AddressSpace {
     }
 
     pub fn unmap(&self, va: VAddr, size: u64) {
-        let mut tracking = self.lock_for_rebuild(va, size);
+        let mut tracking = self.lock_for_rebuild(va, size, None);
         self.clear_pages(&mut tracking, va, size);
         if let Some(fastmem) = &self.fastmem {
             fastmem
@@ -301,7 +301,7 @@ impl AddressSpace {
     /// Changes the permission of the mapped pages of `[va, va + size)`. Write-tracked pages
     /// stay write-protected in the fastmem arena, and pages with a flush trap inaccessible.
     pub fn protect(&self, va: VAddr, size: u64, perm: MemoryPermission) {
-        let _update = self.lock_for_rebuild(va, size);
+        let _update = self.lock_for_rebuild(va, size, None);
         let start = va & !PAGE_MASK;
         let pages = (va + size).div_ceil(PAGE_SIZE) - start / PAGE_SIZE;
         let mut run: Option<(VAddr, u64)> = None;
@@ -321,25 +321,44 @@ impl AddressSpace {
         self.publish_exposed();
     }
 
-    /// Locks `update` for a change to the fastmem views over `[va, va + size)`. Rebuilding a view
-    /// maps it accessible before it can be protected again (Windows), so the GPU first writes
-    /// back the trapped pages a rebuild would expose; pages armed again meanwhile are written
-    /// back on the next attempt, and after the last the change goes ahead regardless.
-    fn lock_for_rebuild(&self, va: VAddr, size: u64) -> MutexGuard<'_, Tracking> {
-        const ATTEMPTS: usize = 4;
+    /// Locks `update` for a change to the fastmem views over `[va, va + size)`, which maps the
+    /// physical pages from `mapped` there if given. Where the host maps a view accessible before
+    /// it can protect it (Windows), the GPU first writes back the trapped pages the change would
+    /// expose: those of views it rebuilds, and those it maps. Pages armed again meanwhile are
+    /// written back on the next attempt; the handler disarms what it writes back, so only a GPU
+    /// rewriting the same pages throughout outlasts the attempts, and the change then goes ahead.
+    fn lock_for_rebuild(
+        &self,
+        va: VAddr,
+        size: u64,
+        mapped: Option<PAddr>,
+    ) -> MutexGuard<'_, Tracking> {
+        const ATTEMPTS: usize = 16;
         for _ in 1..ATTEMPTS {
             let tracking = self.update.lock();
-            let exposed = self.fastmem.as_ref().map_or_else(Vec::new, |fastmem| {
-                fastmem
-                    .arena
-                    .trapped_in_rebuilt_views(va as usize, size as usize)
-            });
+            let mut exposed: Vec<PAddr> = Vec::new();
+            if let Some(fastmem) = &self.fastmem {
+                exposed.extend(
+                    fastmem
+                        .arena
+                        .trapped_in_rebuilt_views(va as usize, size as usize)
+                        .into_iter()
+                        .filter_map(|page| self.physical_address(page as VAddr)),
+                );
+                if let Some(pa) = mapped.filter(|_| fastmem.arena.exposes_new_views()) {
+                    exposed.extend(
+                        (pa..pa + size)
+                            .step_by(PAGE_SIZE as usize)
+                            .filter(|&page| self.trapped.test(page)),
+                    );
+                }
+            }
             if exposed.is_empty() {
                 return tracking;
             }
             drop(tracking);
             for page in exposed {
-                self.flush_trap(page as VAddr);
+                self.flush_physical(page);
             }
         }
         self.update.lock()
@@ -496,10 +515,14 @@ impl AddressSpace {
     #[cold]
     #[inline(never)]
     fn flush_trap(&self, va: VAddr) {
-        let Some(pa) = self.physical_address(va) else {
-            return;
-        };
-        let page = pa & !PAGE_MASK;
+        if let Some(pa) = self.physical_address(va) {
+            self.flush_physical(pa & !PAGE_MASK);
+        }
+    }
+
+    /// Has the GPU-modified data of physical page `page` written back, if it is trapped.
+    #[cold]
+    fn flush_physical(&self, page: PAddr) {
         if !self.trapped.test(page) {
             return;
         }

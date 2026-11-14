@@ -417,6 +417,16 @@ mod faults {
             rebuilt.as_slice(),
             "splitting the view writes back its trapped page only where the split exposes it"
         );
+
+        recorder.calls.lock().clear();
+        device.arm_flush_traps(0x1_0000_1000, 0x1000);
+        space.map(0x5000_0000, 0x10_1000, 0x1000, MemoryPermission::READ_WRITE);
+        assert_eq!(
+            recorder.calls.lock().as_slice(),
+            rebuilt.as_slice(),
+            "a new alias writes back its trapped page only where the new view is briefly accessible"
+        );
+        space.unmap(0x5000_0000, 0x1000);
     }
 
     #[test]
