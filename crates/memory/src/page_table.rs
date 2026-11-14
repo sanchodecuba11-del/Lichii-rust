@@ -105,7 +105,7 @@ impl PageTable {
     /// Host pointer for an access to `addr` that needs `need`, ignoring flush traps.
     #[inline]
     pub(crate) fn access(&self, addr: u64, need: MemoryPermission) -> Result<*mut u8, MemoryFault> {
-        self.access_with(addr, need, &no_trap)
+        self.access_with(addr, need, no_trap)
     }
 
     /// Host pointer for an access to `addr` that needs `need`. On a page with a flush trap it
@@ -116,7 +116,7 @@ impl PageTable {
         &self,
         addr: u64,
         need: MemoryPermission,
-        trap: &impl Fn(u64),
+        trap: impl Fn(u64) + Copy,
     ) -> Result<*mut u8, MemoryFault> {
         let entry = self.entry(addr).ok_or(MemoryFault::unmapped(addr))?;
         let raw = entry.load(Ordering::Acquire);
@@ -135,7 +135,7 @@ impl PageTable {
         mut raw: usize,
         addr: u64,
         need: MemoryPermission,
-        trap: &impl Fn(u64),
+        trap: impl Fn(u64) + Copy,
     ) -> Result<*mut u8, MemoryFault> {
         while raw & FLUSH_TRAP != 0 {
             trap(addr);
@@ -191,7 +191,7 @@ impl PageTable {
         &self,
         addr: u64,
         need: MemoryPermission,
-        trap: &impl Fn(u64),
+        trap: impl Fn(u64) + Copy,
     ) -> Result<T, MemoryFault> {
         let size = std::mem::size_of::<T>() as u64;
         if (addr & PAGE_MASK) + size <= PAGE_SIZE {
@@ -199,6 +199,18 @@ impl PageTable {
             // SAFETY: the whole value is inside one mapped page.
             return Ok(unsafe { std::ptr::read_unaligned(ptr as *const T) });
         }
+        self.read_split(addr, need, trap)
+    }
+
+    /// [`PageTable::read`] of a value that crosses a page boundary.
+    #[cold]
+    #[inline(never)]
+    fn read_split<T: bytemuck::Pod>(
+        &self,
+        addr: u64,
+        need: MemoryPermission,
+        trap: impl Fn(u64) + Copy,
+    ) -> Result<T, MemoryFault> {
         let mut value = T::zeroed();
         self.read_bytes(addr, bytemuck::bytes_of_mut(&mut value), need, trap)?;
         Ok(value)
@@ -221,12 +233,13 @@ impl PageTable {
         self.write_bytes(addr, bytemuck::bytes_of(&value), need)
     }
 
+    #[inline]
     pub(crate) fn read_bytes(
         &self,
         addr: u64,
         out: &mut [u8],
         need: MemoryPermission,
-        trap: &impl Fn(u64),
+        trap: impl Fn(u64) + Copy,
     ) -> Result<(), MemoryFault> {
         self.for_each_chunk(addr, out.len() as u64, need, trap, |ptr, offset, len| {
             // SAFETY: ptr is valid for len bytes inside one mapped page.
@@ -244,7 +257,7 @@ impl PageTable {
             addr,
             data.len() as u64,
             need,
-            &no_trap,
+            no_trap,
             |ptr, offset, len| {
                 // SAFETY: ptr is valid for len bytes inside one mapped page.
                 unsafe { std::ptr::copy_nonoverlapping(data[offset..].as_ptr(), ptr, len) };
@@ -259,18 +272,19 @@ impl PageTable {
         byte: u8,
         need: MemoryPermission,
     ) -> Result<(), MemoryFault> {
-        self.for_each_chunk(addr, size, need, &no_trap, |ptr, _, len| {
+        self.for_each_chunk(addr, size, need, no_trap, |ptr, _, len| {
             // SAFETY: ptr is valid for len bytes inside one mapped page.
             unsafe { std::ptr::write_bytes(ptr, byte, len) };
         })
     }
 
+    #[inline]
     pub(crate) fn for_each_chunk(
         &self,
         addr: u64,
         size: u64,
         need: MemoryPermission,
-        trap: &impl Fn(u64),
+        trap: impl Fn(u64) + Copy,
         mut f: impl FnMut(*mut u8, usize, usize),
     ) -> Result<(), MemoryFault> {
         let mut done = 0u64;
@@ -352,7 +366,7 @@ mod tests {
             table.set(ADDR, b, RW, flags);
         };
         let ptr = table
-            .access_with(ADDR + 0x10, MemoryPermission::READ, &remap)
+            .access_with(ADDR + 0x10, MemoryPermission::READ, remap)
             .unwrap();
         assert_eq!(traps.get(), 2, "the page it was remapped to trapped too");
         assert_eq!(ptr, b.wrapping_add(0x10));
@@ -361,7 +375,7 @@ mod tests {
         traps.set(0);
         let ignore = |_: u64| traps.set(traps.get() + 1);
         let ptr = table
-            .access_with(ADDR + 0x10, MemoryPermission::READ, &ignore)
+            .access_with(ADDR + 0x10, MemoryPermission::READ, ignore)
             .unwrap();
         assert_eq!(
             traps.get(),

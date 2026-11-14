@@ -296,7 +296,7 @@ impl DeviceAddressSpace {
     /// Reads a value; it may straddle pages. Fails on the first unmapped page.
     #[inline]
     pub fn read<T: bytemuck::Pod>(&self, daddr: DAddr) -> Result<T, MemoryFault> {
-        self.table.read(daddr, MemoryPermission::NONE, &no_trap)
+        self.table.read(daddr, MemoryPermission::NONE, no_trap)
     }
 
     /// Writes a value; it may straddle pages. Fails on the first unmapped page, after writing the
@@ -309,7 +309,7 @@ impl DeviceAddressSpace {
     /// Copies `out.len()` bytes from `daddr`. Fails on the first unmapped page.
     pub fn read_bytes(&self, daddr: DAddr, out: &mut [u8]) -> Result<(), MemoryFault> {
         self.table
-            .read_bytes(daddr, out, MemoryPermission::NONE, &no_trap)
+            .read_bytes(daddr, out, MemoryPermission::NONE, no_trap)
     }
 
     /// Copies `data` to `daddr`. Fails on the first unmapped page, after writing the bytes
