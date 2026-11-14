@@ -1194,12 +1194,15 @@ impl Rasterizer for VulkanRasterizer {
             };
             hit.then_some(tick)
         });
+        let diag_start = std::time::Instant::now();
+        let diag_hit = last.is_some();
         if let Some(tick) = last {
             self.flush();
             if let Err(error) = self.scheduler.wait(tick) {
                 tracing::error!(%error, "waiting for GPU work failed");
             }
         }
+        diag_why::sync(diag_hit, addr, diag_start.elapsed().as_nanos() as u64);
         self.release_fences(false);
         self.flush_region(addr, size);
     }
@@ -1231,6 +1234,7 @@ impl Rasterizer for VulkanRasterizer {
                 }) => {
                     let bytes = release_bytes(size);
                     if lands(address.wrapping_sub(mirror), bytes) {
+                        diag_why::note(2, address);
                         return false;
                     }
                     let words = [
@@ -1248,11 +1252,13 @@ impl Rasterizer for VulkanRasterizer {
                 }
                 Release::Action(FenceAction::ReduceSemaphore { address, .. }) => {
                     if writes(address, 4) {
+                        diag_why::note(1, address);
                         return false;
                     }
                 }
                 Release::Samples { address, size, .. } => {
                     if writes(address, release_bytes(size)) {
+                        diag_why::note(0, address);
                         return false;
                     }
                 }
@@ -1261,6 +1267,7 @@ impl Rasterizer for VulkanRasterizer {
                 | Release::SamplesFold(_) => {}
             }
         }
+        diag_why::note(3, addr);
         true
     }
 
@@ -2495,5 +2502,88 @@ mod tests {
             "the read lands the target's texels"
         );
         f.assert_no_validation_errors();
+    }
+}
+
+mod diag_why {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct S {
+        t: u64,
+        kinds: [u64; 4],
+        addrs: [HashMap<u64, u64>; 4],
+        hit: u64,
+        hit_ns: u64,
+        miss: u64,
+        sync_addrs: HashMap<u64, (u64, u64)>,
+    }
+
+    static ST: Mutex<Option<S>> = Mutex::new(None);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    pub(super) fn note(kind: usize, address: u64) {
+        let mut g = ST.lock().unwrap();
+        let s = g.get_or_insert_with(S::default);
+        s.kinds[kind] += 1;
+        *s.addrs[kind].entry(address).or_default() += 1;
+        print(s);
+    }
+
+    pub(super) fn sync(hit: bool, addr: u64, ns: u64) {
+        let mut g = ST.lock().unwrap();
+        let s = g.get_or_insert_with(S::default);
+        if hit {
+            s.hit += 1;
+            s.hit_ns += ns;
+            let e = s.sync_addrs.entry(addr).or_default();
+            e.0 += 1;
+            e.1 += ns;
+        } else {
+            s.miss += 1;
+        }
+        print(s);
+    }
+
+    fn print(s: &mut S) {
+        let now = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+        if now < s.t + 5 {
+            return;
+        }
+        let top = |m: &HashMap<u64, u64>| {
+            let mut v: Vec<_> = m.iter().map(|(a, n)| (*n, *a)).collect();
+            v.sort_unstable_by(|a, b| b.cmp(a));
+            v.iter()
+                .take(6)
+                .map(|(n, a)| format!("{a:#x}x{n}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut sa: Vec<_> = s.sync_addrs.iter().map(|(a, (n, ns))| (*ns, *n, *a)).collect();
+        sa.sort_unstable_by(|a, b| b.cmp(a));
+        let sa: Vec<String> = sa
+            .iter()
+            .take(6)
+            .map(|(ns, n, a)| format!("{a:#x}x{n}={}ms", ns / 1_000_000))
+            .collect();
+        tracing::info!(
+            "DIAG why t={now} known={} samples={} reduce={} mirror={} | sync_hit={} hit_ms={} sync_miss={} | samples_at=[{}] reduce_at=[{}] mirror_at=[{}] sync_at=[{}]",
+            s.kinds[3],
+            s.kinds[0],
+            s.kinds[1],
+            s.kinds[2],
+            s.hit,
+            s.hit_ns / 1_000_000,
+            s.miss,
+            top(&s.addrs[0]),
+            top(&s.addrs[1]),
+            top(&s.addrs[2]),
+            sa.join(",")
+        );
+        *s = S {
+            t: now,
+            ..S::default()
+        };
     }
 }
