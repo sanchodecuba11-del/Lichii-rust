@@ -595,7 +595,7 @@ impl AddressSpace {
         let trap = |at| self.flush_trap(at);
         let start = va & !PAGE_MASK;
         for page in (start..va.saturating_add(size)).step_by(PAGE_SIZE as usize) {
-            let _ = self.table.access_with(page, MemoryPermission::NONE, &trap);
+            let _ = self.table.access_with(page, MemoryPermission::NONE, trap);
         }
     }
 
@@ -638,7 +638,7 @@ impl AddressSpace {
     ) -> Result<(), MemoryFault> {
         let trap = |at| self.flush_trap(at);
         self.table
-            .for_each_chunk(va, size, need, &trap, |ptr, offset, len| {
+            .for_each_chunk(va, size, need, trap, |ptr, offset, len| {
                 copy(ptr, offset, len);
                 self.report_write(ptr);
             })
@@ -653,9 +653,7 @@ impl AddressSpace {
     ) -> Result<(), MemoryFault> {
         let size = std::mem::size_of::<T>();
         if (va & PAGE_MASK) as usize + size <= PAGE_SIZE as usize {
-            let ptr = self
-                .table
-                .access_with(va, need, &|at| self.flush_trap(at))?;
+            let ptr = self.table.access_with(va, need, |at| self.flush_trap(at))?;
             // SAFETY: the whole value is inside one mapped page.
             unsafe { std::ptr::write_unaligned(ptr as *mut T, value) };
             self.report_write(ptr);
@@ -704,7 +702,7 @@ impl AddressSpace {
     /// first.
     #[inline]
     pub fn access(&self, va: VAddr, need: MemoryPermission) -> Result<*mut u8, MemoryFault> {
-        self.table.access_with(va, need, &|at| self.flush_trap(at))
+        self.table.access_with(va, need, |at| self.flush_trap(at))
     }
 
     /// Host pointer for `[va, va + size)` when it is mapped to contiguous DRAM.
@@ -726,7 +724,7 @@ impl AddressSpace {
     #[inline]
     pub fn read<T: bytemuck::Pod>(&self, va: VAddr) -> Result<T, MemoryFault> {
         self.table
-            .read(va, MemoryPermission::NONE, &|at| self.flush_trap(at))
+            .read(va, MemoryPermission::NONE, |at| self.flush_trap(at))
     }
 
     /// Writes a value, whatever the page permissions (loading code, HLE writes).
@@ -735,9 +733,10 @@ impl AddressSpace {
         self.write_value(va, value, MemoryPermission::NONE)
     }
 
+    #[inline]
     pub fn read_bytes(&self, va: VAddr, out: &mut [u8]) -> Result<(), MemoryFault> {
         self.table
-            .read_bytes(va, out, MemoryPermission::NONE, &|at| self.flush_trap(at))
+            .read_bytes(va, out, MemoryPermission::NONE, |at| self.flush_trap(at))
     }
 
     pub fn write_bytes(&self, va: VAddr, data: &[u8]) -> Result<(), MemoryFault> {
@@ -768,9 +767,7 @@ impl AddressSpace {
         need: MemoryPermission,
         write: impl FnOnce(*mut u8) -> R,
     ) -> Result<R, MemoryFault> {
-        let ptr = self
-            .table
-            .access_with(va, need, &|at| self.flush_trap(at))?;
+        let ptr = self.table.access_with(va, need, |at| self.flush_trap(at))?;
         let result = write(ptr);
         self.report_write(ptr);
         Ok(result)
@@ -780,7 +777,7 @@ impl AddressSpace {
     #[inline]
     pub fn guest_read<T: bytemuck::Pod>(&self, va: VAddr) -> Result<T, MemoryFault> {
         self.table
-            .read(va, MemoryPermission::READ, &|at| self.flush_trap(at))
+            .read(va, MemoryPermission::READ, |at| self.flush_trap(at))
     }
 
     /// A guest store: a page without write permission is a permission fault and is left
