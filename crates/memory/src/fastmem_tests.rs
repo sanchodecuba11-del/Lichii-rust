@@ -327,6 +327,53 @@ mod faults {
     }
 
     #[test]
+    fn armed_pages_fault_on_every_access_until_disarmed() {
+        let faults = AtomicU64::new(0);
+        let Some((space, device)) = tracked_space() else {
+            return;
+        };
+        let fastmem = space.fastmem().unwrap();
+        let base = fastmem.base();
+        space.map(0x4000_0000, 0x10_0000, 0x2000, MemoryPermission::READ_WRITE);
+        device
+            .map_process(0x1_0000_0000, &space, 0x4000_0000, 0x2000)
+            .unwrap();
+        space.write(0x4000_0008, 7u64).unwrap();
+        fastmem.set_fault_handler(Some(skip_load_quietly), 0xdead);
+
+        device.arm_flush_traps(0x1_0000_0000, 0x1000);
+        assert_eq!(
+            load(base, 0x4000_0008),
+            0xdead,
+            "an armed page is inaccessible"
+        );
+        assert_eq!(load(base, 0x4000_1008), 0, "the page beside it is not");
+        let cached = device.cache_pages(0x1_0000_0000, 0x1000);
+        space.protect(0x4000_0000, 0x2000, MemoryPermission::READ);
+        space.protect(0x4000_0000, 0x2000, MemoryPermission::READ_WRITE);
+        assert_eq!(
+            load(base, 0x4000_0008),
+            0xdead,
+            "tracking and protect keep it inaccessible"
+        );
+        space.map(0x5000_0000, 0x10_0000, 0x1000, MemoryPermission::READ_WRITE);
+        assert_eq!(load(base, 0x5000_0008), 0xdead, "so is a new alias");
+
+        device.disarm_flush_traps(0x1_0000_0000, 0x1000);
+        assert_eq!(load(base, 0x4000_0008), 7, "disarmed, it reads again");
+        assert_eq!(load(base, 0x5000_0008), 7);
+        fastmem.set_fault_handler(Some(count_store), &faults as *const AtomicU64 as usize);
+        store(base, 0x4000_0010, 1);
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            1,
+            "a tracked page stays write-protected after disarming"
+        );
+        drop(cached);
+        space.unmap(0x5000_0000, 0x1000);
+    }
+
+    #[test]
     fn views_mapped_again_over_tracked_pages_publish_them() {
         let faults = AtomicU64::new(0);
         let Some((space, device)) = tracked_space() else {

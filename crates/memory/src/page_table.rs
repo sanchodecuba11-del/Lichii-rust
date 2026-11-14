@@ -9,7 +9,15 @@ const L2_BITS: u32 = 14;
 const L2_ENTRIES: usize = 1 << L2_BITS;
 const PERM_MASK: usize = 0xfff;
 /// Set on process pages whose physical page a GPU cache holds ([`crate::tracking`]).
-const TRACKED: usize = 0x800;
+pub(crate) const TRACKED: usize = 0x800;
+/// Set on process pages whose physical page holds GPU-modified data not written back yet: every
+/// host access through the table calls its trap first ([`crate::tracking`]).
+pub(crate) const FLUSH_TRAP: usize = 0x400;
+const FLAGS: usize = TRACKED | FLUSH_TRAP;
+
+/// The trap callback of accesses that never meet a flush trap, such as device accesses.
+#[inline]
+pub(crate) fn no_trap(_addr: u64) {}
 
 type L2Table = [AtomicUsize; L2_ENTRIES];
 
@@ -63,21 +71,21 @@ impl PageTable {
             return false;
         }
         entry.store(
-            (old & (!PERM_MASK | TRACKED)) | perm.0 as usize,
+            (old & (!PERM_MASK | FLAGS)) | perm.0 as usize,
             Ordering::Release,
         );
         true
     }
 
-    /// Sets or clears the tracked flag of a mapped page. Returns the page's permission when the
-    /// flag changed.
-    pub(crate) fn set_tracked(&self, addr: u64, tracked: bool) -> Option<MemoryPermission> {
+    /// Sets the [`TRACKED`] and [`FLUSH_TRAP`] flags of a mapped page to `flags`. Returns the
+    /// page's permission when they changed.
+    pub(crate) fn set_flags(&self, addr: u64, flags: usize) -> Option<MemoryPermission> {
         let entry = self.entry(addr)?;
         let old = entry.load(Ordering::Acquire);
-        if old == 0 || (old & TRACKED != 0) == tracked {
+        if old == 0 || old & FLAGS == flags {
             return None;
         }
-        entry.store(old ^ TRACKED, Ordering::Release);
+        entry.store((old & !FLAGS) | flags, Ordering::Release);
         Some(MemoryPermission(old as u8 & 7))
     }
 
@@ -93,21 +101,65 @@ impl PageTable {
         Some((ptr, MemoryPermission(raw as u8 & 7)))
     }
 
-    /// Host pointer for `[addr, addr + size)` when every page is mapped and the host pages are
-    /// contiguous, so the whole range can be accessed as one slice.
-    /// Host pointer for an access to `addr` that needs `need`.
+    /// Host pointer for an access to `addr` that needs `need`, ignoring flush traps.
     #[inline]
     pub(crate) fn access(&self, addr: u64, need: MemoryPermission) -> Result<*mut u8, MemoryFault> {
-        let (ptr, perm) = self.translate(addr).ok_or(MemoryFault::unmapped(addr))?;
-        if !perm.contains(need) {
+        self.access_with(addr, need, &no_trap)
+    }
+
+    /// Host pointer for an access to `addr` that needs `need`. On a page with a flush trap it
+    /// calls `trap` with `addr` first, then accesses the page whatever the trap did.
+    #[inline]
+    pub(crate) fn access_with(
+        &self,
+        addr: u64,
+        need: MemoryPermission,
+        trap: &impl Fn(u64),
+    ) -> Result<*mut u8, MemoryFault> {
+        let entry = self.entry(addr).ok_or(MemoryFault::unmapped(addr))?;
+        let raw = entry.load(Ordering::Acquire);
+        let need_bits = need.0 as usize;
+        if raw & (FLUSH_TRAP | need_bits) == need_bits && raw != 0 {
+            return Ok(Self::pointer(raw, addr));
+        }
+        Self::access_slow(entry, raw, addr, need, trap)
+    }
+
+    /// [`PageTable::access_with`] for an entry that is unmapped, lacks `need` or has a flush
+    /// trap.
+    #[cold]
+    fn access_slow(
+        entry: &AtomicUsize,
+        mut raw: usize,
+        addr: u64,
+        need: MemoryPermission,
+        trap: &impl Fn(u64),
+    ) -> Result<*mut u8, MemoryFault> {
+        if raw & FLUSH_TRAP != 0 {
+            trap(addr);
+            raw = entry.load(Ordering::Acquire);
+        }
+        if raw == 0 {
+            return Err(MemoryFault::unmapped(addr));
+        }
+        if !MemoryPermission(raw as u8 & 7).contains(need) {
             return Err(MemoryFault {
                 addr,
                 kind: FaultKind::Permission,
             });
         }
-        Ok(ptr)
+        Ok(Self::pointer(raw, addr))
     }
 
+    #[inline]
+    fn pointer(raw: usize, addr: u64) -> *mut u8 {
+        let host = (raw & !PERM_MASK) as *mut u8;
+        // SAFETY: the offset stays inside the mapped page.
+        unsafe { host.add((addr & PAGE_MASK) as usize) }
+    }
+
+    /// Host pointer for `[addr, addr + size)` when every page is mapped and the host pages are
+    /// contiguous, so the whole range can be accessed as one slice.
     pub(crate) fn contiguous(&self, addr: u64, size: u64) -> Option<*mut u8> {
         let (first, _) = self.translate(addr)?;
         if size == 0 {
@@ -133,15 +185,16 @@ impl PageTable {
         &self,
         addr: u64,
         need: MemoryPermission,
+        trap: &impl Fn(u64),
     ) -> Result<T, MemoryFault> {
         let size = std::mem::size_of::<T>() as u64;
         if (addr & PAGE_MASK) + size <= PAGE_SIZE {
-            let ptr = self.access(addr, need)?;
+            let ptr = self.access_with(addr, need, trap)?;
             // SAFETY: the whole value is inside one mapped page.
             return Ok(unsafe { std::ptr::read_unaligned(ptr as *const T) });
         }
         let mut value = T::zeroed();
-        self.read_bytes(addr, bytemuck::bytes_of_mut(&mut value), need)?;
+        self.read_bytes(addr, bytemuck::bytes_of_mut(&mut value), need, trap)?;
         Ok(value)
     }
 
@@ -167,8 +220,9 @@ impl PageTable {
         addr: u64,
         out: &mut [u8],
         need: MemoryPermission,
+        trap: &impl Fn(u64),
     ) -> Result<(), MemoryFault> {
-        self.for_each_chunk(addr, out.len() as u64, need, |ptr, offset, len| {
+        self.for_each_chunk(addr, out.len() as u64, need, trap, |ptr, offset, len| {
             // SAFETY: ptr is valid for len bytes inside one mapped page.
             unsafe { std::ptr::copy_nonoverlapping(ptr, out[offset..].as_mut_ptr(), len) };
         })
@@ -180,10 +234,16 @@ impl PageTable {
         data: &[u8],
         need: MemoryPermission,
     ) -> Result<(), MemoryFault> {
-        self.for_each_chunk(addr, data.len() as u64, need, |ptr, offset, len| {
-            // SAFETY: ptr is valid for len bytes inside one mapped page.
-            unsafe { std::ptr::copy_nonoverlapping(data[offset..].as_ptr(), ptr, len) };
-        })
+        self.for_each_chunk(
+            addr,
+            data.len() as u64,
+            need,
+            &no_trap,
+            |ptr, offset, len| {
+                // SAFETY: ptr is valid for len bytes inside one mapped page.
+                unsafe { std::ptr::copy_nonoverlapping(data[offset..].as_ptr(), ptr, len) };
+            },
+        )
     }
 
     pub(crate) fn fill(
@@ -193,7 +253,7 @@ impl PageTable {
         byte: u8,
         need: MemoryPermission,
     ) -> Result<(), MemoryFault> {
-        self.for_each_chunk(addr, size, need, |ptr, _, len| {
+        self.for_each_chunk(addr, size, need, &no_trap, |ptr, _, len| {
             // SAFETY: ptr is valid for len bytes inside one mapped page.
             unsafe { std::ptr::write_bytes(ptr, byte, len) };
         })
@@ -204,13 +264,18 @@ impl PageTable {
         addr: u64,
         size: u64,
         need: MemoryPermission,
+        trap: &impl Fn(u64),
         mut f: impl FnMut(*mut u8, usize, usize),
     ) -> Result<(), MemoryFault> {
         let mut done = 0u64;
         while done < size {
             let at = addr + done;
             let len = (PAGE_SIZE - (at & PAGE_MASK)).min(size - done);
-            f(self.access(at, need)?, done as usize, len as usize);
+            f(
+                self.access_with(at, need, trap)?,
+                done as usize,
+                len as usize,
+            );
             done += len;
         }
         Ok(())
