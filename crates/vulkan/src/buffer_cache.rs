@@ -787,8 +787,10 @@ impl BufferCache {
     /// The GPU wrote `[daddr, +size)` (storage writes, transform feedback, copies): the bytes
     /// stay in the host buffer until [`BufferCache::flush`] downloads them, and the pages are
     /// marked in the written-pages bitmap. Called when the writing work is recorded.
+    #[track_caller]
     pub fn mark_gpu_written(&mut self, daddr: DAddr, size: u64) {
         let end = daddr.saturating_add(size).min(self.limit);
+        diag_fetch::mark(daddr, end, std::panic::Location::caller().line());
         if daddr < end {
             self.written_pages.mark(daddr, end - daddr);
             self.gpu_written.insert(daddr, end);
@@ -801,6 +803,10 @@ impl BufferCache {
         if !self.gpu_written.intersects(daddr, end) {
             return Ok(());
         }
+        let diag_start = std::time::Instant::now();
+        let mut diag_window = 0;
+        self.gpu_written
+            .for_each_in(daddr & !0xffff, (daddr | 0xffff) + 1, |s, e| diag_window += e - s);
         let Self {
             page_table,
             buffers,
@@ -863,6 +869,7 @@ impl BufferCache {
         }
         self.gpu_written.subtract(daddr, end);
         self.stats.downloaded_bytes += total;
+        diag_fetch::flush(daddr, size, total, diag_window, diag_start.elapsed().as_nanos() as u64);
         Ok(())
     }
 
@@ -1252,6 +1259,7 @@ impl BufferCache {
     /// [`BufferCache::storage_alignment`]. With `written`, the range is marked GPU-written; a
     /// written range over scattered memory binds only its first contiguous run (as Lichii does
     /// without sparse binding).
+    #[track_caller]
     pub fn storage_buffer(
         &mut self,
         scheduler: &mut Scheduler,
@@ -1298,6 +1306,7 @@ impl BufferCache {
     /// GPU-written. `None` when no device memory backs the range or the run's offset breaks
     /// the device's texel buffer alignment.
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn texel_buffer(
         &mut self,
         scheduler: &mut Scheduler,
@@ -2498,5 +2507,109 @@ mod tests {
             (full * 0x10000) as f64 / full_s / f64::from(1 << 20),
         );
         f.assert_no_validation_errors();
+    }
+}
+
+mod diag_fetch {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct S {
+        t: u64,
+        marks: BTreeMap<u64, (u64, u32)>,
+        mark_lines: HashMap<u32, (u64, u64)>,
+        flushes: u64,
+        ns: u64,
+        bytes: u64,
+        window: u64,
+        by_line: HashMap<u32, (u64, u64)>,
+        mark_size: HashMap<u32, u64>,
+        req_size: HashMap<u64, u64>,
+        addrs: HashSet<u64>,
+        pages: HashSet<u64>,
+        regions: HashSet<u64>,
+        uncovered: u64,
+    }
+
+    static ST: Mutex<Option<S>> = Mutex::new(None);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    pub(super) fn mark(start: u64, end: u64, line: u32) {
+        let mut g = ST.lock().unwrap();
+        let s = g.get_or_insert_with(S::default);
+        if s.marks.len() > 200_000 {
+            s.marks.clear();
+        }
+        s.marks.insert(start, (end, line));
+        let e = s.mark_lines.entry(line).or_default();
+        e.0 += 1;
+        e.1 += end.saturating_sub(start);
+    }
+
+    pub(super) fn flush(daddr: u64, size: u64, total: u64, window: u64, ns: u64) {
+        let mut g = ST.lock().unwrap();
+        let s = g.get_or_insert_with(S::default);
+        s.flushes += 1;
+        s.ns += ns;
+        s.bytes += total;
+        s.window += window;
+        *s.req_size.entry(size).or_default() += 1;
+        s.addrs.insert(daddr);
+        s.pages.insert(daddr >> 12);
+        s.regions.insert(daddr >> 16);
+        let covering = s
+            .marks
+            .range(..=daddr)
+            .next_back()
+            .filter(|(_, (end, _))| *end > daddr)
+            .map(|(start, (end, line))| (end - start, *line));
+        match covering {
+            Some((len, line)) => {
+                let e = s.by_line.entry(line).or_default();
+                e.0 += 1;
+                e.1 += ns;
+                *s.mark_size.entry(64 - len.leading_zeros()).or_default() += 1;
+            }
+            None => s.uncovered += 1,
+        }
+        let now = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+        if now < s.t + 5 {
+            return;
+        }
+        let mut lines: Vec<_> = s.by_line.iter().map(|(l, (n, ns))| format!("L{l}:{n}/{}ms", ns / 1_000_000)).collect();
+        lines.sort();
+        let mut ml: Vec<_> = s.mark_lines.iter().map(|(l, (n, b))| format!("L{l}:{n}x{}KB", b / 1024)).collect();
+        ml.sort();
+        let mut ms: Vec<_> = s.mark_size.iter().map(|(b, n)| (*b, *n)).collect();
+        ms.sort();
+        let mut rs: Vec<_> = s.req_size.iter().map(|(b, n)| (*n, *b)).collect();
+        rs.sort_unstable_by(|a, b| b.cmp(a));
+        rs.truncate(5);
+        let mut sample: Vec<_> = s.addrs.iter().copied().collect();
+        sample.sort_unstable();
+        let sample: Vec<String> = sample.iter().step_by((sample.len() / 8).max(1)).take(8).map(|a| format!("{a:#x}")).collect();
+        tracing::info!(
+            "DIAG bflush t={now} n={} ms={} bytes={} avg_window={} addrs={} pages4k={} regions64k={} uncovered={} writer_of_flushed=[{}] mark_size_log2={:?} req_size={:?} marks_by_line=[{}] sample=[{}]",
+            s.flushes,
+            s.ns / 1_000_000,
+            s.bytes,
+            s.window / s.flushes.max(1),
+            s.addrs.len(),
+            s.pages.len(),
+            s.regions.len(),
+            s.uncovered,
+            lines.join(","),
+            ms,
+            rs,
+            ml.join(","),
+            sample.join(",")
+        );
+        let marks = std::mem::take(&mut s.marks);
+        *s = S {
+            t: now,
+            marks,
+            ..S::default()
+        };
     }
 }

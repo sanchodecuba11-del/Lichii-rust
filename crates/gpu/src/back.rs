@@ -303,9 +303,11 @@ impl Back {
                     m if m == FetchSync::HostIfWritten as u32 => self.written(address, size),
                     _ => false,
                 };
+                let diag_start = std::time::Instant::now();
                 if host {
                     self.synchronize_read(address, size);
                 }
+                crate::dma_pusher::diag_fx::back(method, host, size, diag_start.elapsed().as_nanos() as u64);
                 self.fetch_syncs.complete();
                 3
             }

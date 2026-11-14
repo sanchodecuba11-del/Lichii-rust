@@ -405,6 +405,7 @@ impl FrontChannel {
             } else {
                 None
             };
+            diag_fx::front(sync.map(|s| s as u32), entry.sync(), u64::from(length) * 4);
             if let Some(sync) = sync {
                 let ticket =
                     shared
@@ -1012,5 +1013,55 @@ mod diag_mr {
                 N[3].swap(0, Ordering::Relaxed) / 1_000_000
             );
         }
+    }
+}
+
+pub(crate) mod diag_fx {
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct S {
+        t: u64,
+        entries: u64,
+        sync_bit: u64,
+        kinds: [u64; 4],
+        back: [(u64, u64); 4],
+        back_host: u64,
+        back_bytes: u64,
+    }
+
+    static ST: Mutex<Option<S>> = Mutex::new(None);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    pub(crate) fn front(kind: Option<u32>, sync_bit: bool, _bytes: u64) {
+        let mut g = ST.lock().unwrap();
+        let s = g.get_or_insert_with(S::default);
+        s.entries += 1;
+        s.sync_bit += u64::from(sync_bit);
+        s.kinds[kind.map_or(3, |k| (k as usize).min(2))] += 1;
+    }
+
+    pub(crate) fn back(method: u32, host: bool, bytes: u64, ns: u64) {
+        let mut g = ST.lock().unwrap();
+        let s = g.get_or_insert_with(S::default);
+        let k = (method as usize).min(3);
+        s.back[k].0 += 1;
+        s.back[k].1 += ns;
+        s.back_host += u64::from(host);
+        s.back_bytes += if host { bytes } else { 0 };
+        let now = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+        if now < s.t + 5 {
+            return;
+        }
+        tracing::info!(
+            "DIAG fetch t={now} entries={} sync_bit={} front_kinds(m0,m1,m2,none)={:?} back_by_method(n,ms)={:?} back_host={} back_host_bytes={}",
+            s.entries,
+            s.sync_bit,
+            s.kinds,
+            s.back.map(|(n, ns)| (n, ns / 1_000_000)),
+            s.back_host,
+            s.back_bytes
+        );
+        *s = S { t: now, ..S::default() };
     }
 }
