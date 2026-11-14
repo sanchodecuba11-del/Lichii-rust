@@ -164,13 +164,20 @@ impl DeviceAddressSpace {
         let sink = handler.map(|handler| {
             let reverse = self.update.clone();
             let armed = self.armed.clone();
+            let process = Arc::downgrade(process);
             Arc::new(move |pa: PAddr| {
                 let mut pages: Vec<DAddr> = Vec::new();
                 reverse.lock().for_each(pa, |daddr| pages.push(daddr));
                 for &daddr in &pages {
                     handler.flush_for_cpu(daddr, PAGE_SIZE);
                 }
-                any_armed(&reverse.lock(), &armed, pa)
+                let reverse = reverse.lock();
+                if !any_armed(&reverse, &armed, pa)
+                    && let Some(process) = process.upgrade()
+                {
+                    process.disarm_physical(&[(pa, PAGE_SIZE)]);
+                }
+                true
             }) as crate::address_space::FlushSink
         });
         process.set_flush_sink(sink);

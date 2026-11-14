@@ -101,8 +101,9 @@ impl Fastmem {
     }
 }
 
-/// Called on a flush trap with the physical page it hit; returns false when no device address
-/// maps the page any more, so nothing can write it back.
+/// Called on a flush trap with the physical page it hit; returns whether it settled the trap
+/// (wrote the page back and disarmed it unless the GPU still holds data for it). On false the
+/// trap disarms itself.
 pub(crate) type FlushSink = Arc<dyn Fn(PAddr) -> bool + Send + Sync>;
 
 /// A process's guest virtual address space.
