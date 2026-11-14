@@ -226,14 +226,14 @@ impl Arena {
         self.sys.restrict(self.base, offset, len, prot, cap)
     }
 
-    /// Offsets of the trapped pages (capped at no access) that a change to the views over
-    /// `[offset, offset + len)` would map accessible for a moment: none where views can be
-    /// protected as they are mapped.
     /// Whether a new view is accessible for a moment before its caps apply.
     pub(crate) fn exposes_new_views(&self) -> bool {
         sys::EXPOSES_NEW_VIEWS
     }
 
+    /// Offsets of the trapped pages (capped at no access) that a change to the views over
+    /// `[offset, offset + len)` would map accessible for a moment: none where views can be
+    /// protected as they are mapped.
     pub(crate) fn trapped_in_rebuilt_views(&self, offset: usize, len: usize) -> Vec<usize> {
         let restricted = self.restricted.lock();
         let mut trapped = Vec::new();
