@@ -318,7 +318,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         unary(word & 0xffff_fc00 ^ 0x5000_0000).filter(|&op| op != LaneOp::FromInt)
     {
         (op, false, 1)
-    } else if matches!(word & 0xbf60_fc00, 0x0f20_fc00 | 0x2f20_fc00) {
+    } else if matches!(word & 0xbfe0_fc00, 0x0f20_fc00 | 0x2f20_fc00) {
         let unsigned = word >> 29 & 1 != 0;
         (LaneOp::ToInt { unsigned }, false, vector_lanes)
     } else if let Some(op) = three_same {

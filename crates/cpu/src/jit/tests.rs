@@ -3212,6 +3212,7 @@ fn fp_division_abs_diff_and_conversions_match_the_interpreter() {
         for fbits in [1u32, 20, 64] {
             ops.push(0x4f00_fc20 | u << 29 | (128 - fbits) << 16);
         }
+        ops.push(0x4fb0_fc20 | u << 29);
     }
     let machines = &mut [
         ("interpreter", Machine::new(Backend::Interpreter)),
