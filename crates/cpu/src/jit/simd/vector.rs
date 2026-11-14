@@ -203,6 +203,17 @@ pub enum VecOp {
     /// `USHL` on S or D lanes: each lane of `n` shifted by the signed low byte of `m`'s lane, left
     /// when it is positive and logically right when negative, giving zero from the lane width on.
     Ushl(Arrangement, Value, Value),
+    /// `ADDV`: the sum of every lane, modulo the lane width, in the low lane and zero above.
+    AddAcross(Arrangement, Value),
+    /// `XTN`: the low halves of `a`'s lanes of `16 << size` bits, in the low 64 bits with zero
+    /// above, or for `XTN2` in the high 64 bits above `low`'s low 64.
+    Narrow {
+        size: u8,
+        a: Value,
+        low: Option<Value>,
+    },
+    /// `REV64` on H or S lanes: the lanes of each 64-bit half in reverse order.
+    Rev64(Arrangement, Value),
     /// `TBL` with one table register: byte `i` is byte `index[i]` of `table`, or zero from 16 on,
     /// over 16 bytes when `q` is set and else the low 8.
     Table {
@@ -248,7 +259,15 @@ impl VecOp {
             | VecOp::Dup(_, a)
             | VecOp::Cnt(_, a)
             | VecOp::Extract { vector: a, .. }
-            | VecOp::ShiftLong { a, .. } => f(a),
+            | VecOp::ShiftLong { a, .. }
+            | VecOp::AddAcross(_, a)
+            | VecOp::Rev64(_, a) => f(a),
+            VecOp::Narrow { a, low, .. } => {
+                f(a);
+                if let Some(low) = low {
+                    f(low);
+                }
+            }
             VecOp::RoundShift { acc, a, .. } => {
                 if let Some(acc) = acc {
                     f(acc);
@@ -330,6 +349,32 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
                 m,
             },
         );
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbf3f_fc00 == 0x0e31_b800 && (size < 2 || (size == 2 && q)) {
+        let a = vec(t, rn);
+        let r = emit(t, VecOp::AddAcross(arrangement, a));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbf3f_fc00 == 0x0e21_2800 && size < 3 {
+        let a = vec(t, rn);
+        let low = q.then(|| vec(t, rd));
+        let r = emit(t, VecOp::Narrow { size, a, low });
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbf3f_fc00 == 0x0e20_0800 && matches!(size, 1 | 2) {
+        let a = vec(t, rn);
+        let r = emit(t, VecOp::Rev64(arrangement, a));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbf3f_fc00 == 0x2e20_b800 && (q || size < 3) {
+        let a = vec(t, rn);
+        let zero = emit(t, VecOp::Imm(0, true));
+        let r = emit(t, VecOp::Binary(Binary::Sub, arrangement, zero, a));
         t.set(Loc::V(rd), r);
         return true;
     }
@@ -1368,6 +1413,102 @@ impl Emitter<'_> {
                     ),
                 }
                 dynasm!(self.asm ; .arch x64 ; por Rx(d), Rx(SCRATCH));
+                (d, q)
+            }
+            VecOp::AddAcross(Arrangement { size, q }, a) => {
+                let a = self.reg(a);
+                let d = self.def(v);
+                match (size, q) {
+                    (0, _) => {
+                        match q {
+                            true => self.copy(d, a),
+                            false => dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(a)),
+                        }
+                        dynasm!(self.asm
+                            ; .arch x64
+                            ; pxor Rx(SCRATCH), Rx(SCRATCH)
+                            ; psadbw Rx(d), Rx(SCRATCH)
+                            ; pshufd Rx(SCRATCH), Rx(d), 0x4e
+                            ; paddd Rx(d), Rx(SCRATCH)
+                            ; movd eax, Rx(d)
+                            ; movzx eax, al
+                        );
+                    }
+                    (1, _) => {
+                        self.copy(d, a);
+                        if q {
+                            dynasm!(self.asm
+                                ; .arch x64
+                                ; pshufd Rx(SCRATCH), Rx(d), 0x4e
+                                ; paddw Rx(d), Rx(SCRATCH)
+                            );
+                        }
+                        dynasm!(self.asm
+                            ; .arch x64
+                            ; pshuflw Rx(SCRATCH), Rx(d), 0x4e
+                            ; paddw Rx(d), Rx(SCRATCH)
+                            ; pshuflw Rx(SCRATCH), Rx(d), 0xb1u8 as i8
+                            ; paddw Rx(d), Rx(SCRATCH)
+                            ; movd eax, Rx(d)
+                            ; movzx eax, ax
+                        );
+                    }
+                    _ => {
+                        self.copy(d, a);
+                        dynasm!(self.asm
+                            ; .arch x64
+                            ; pshufd Rx(SCRATCH), Rx(d), 0x4e
+                            ; paddd Rx(d), Rx(SCRATCH)
+                            ; pshufd Rx(SCRATCH), Rx(d), 0xb1u8 as i8
+                            ; paddd Rx(d), Rx(SCRATCH)
+                            ; movd eax, Rx(d)
+                        );
+                    }
+                }
+                dynasm!(self.asm ; .arch x64 ; movd Rx(d), eax);
+                (d, true)
+            }
+            VecOp::Narrow { size, a, low } => {
+                let a = self.reg(a);
+                let low = low.map(|low| self.reg(low));
+                let d = self.def(v);
+                match size {
+                    0 => dynasm!(self.asm
+                        ; .arch x64
+                        ; movdqa Rx(SCRATCH), Rx(a)
+                        ; psllw Rx(SCRATCH), 8
+                        ; psrlw Rx(SCRATCH), 8
+                        ; packuswb Rx(SCRATCH), Rx(SCRATCH)
+                    ),
+                    1 => dynasm!(self.asm
+                        ; .arch x64
+                        ; movdqa Rx(SCRATCH), Rx(a)
+                        ; pslld Rx(SCRATCH), 16
+                        ; psrad Rx(SCRATCH), 16
+                        ; packssdw Rx(SCRATCH), Rx(SCRATCH)
+                    ),
+                    _ => dynasm!(self.asm ; .arch x64 ; pshufd Rx(SCRATCH), Rx(a), 0x08),
+                }
+                match low {
+                    Some(low) => {
+                        self.copy(d, low);
+                        dynasm!(self.asm ; .arch x64 ; punpcklqdq Rx(d), Rx(SCRATCH));
+                    }
+                    None => dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(SCRATCH)),
+                }
+                (d, true)
+            }
+            VecOp::Rev64(Arrangement { size, q }, a) => {
+                let a = self.reg(a);
+                let d = self.def(v);
+                match size {
+                    1 => dynasm!(self.asm
+                        ; .arch x64
+                        ; pshuflw Rx(d), Rx(a), 0x1b
+                        ; pshufhw Rx(d), Rx(d), 0x1b
+                    ),
+                    _ => dynasm!(self.asm ; .arch x64 ; pshufd Rx(d), Rx(a), 0xb1u8 as i8),
+                }
                 (d, q)
             }
             VecOp::Cnt(q, a) => {
