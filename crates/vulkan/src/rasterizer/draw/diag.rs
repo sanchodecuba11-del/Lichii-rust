@@ -99,6 +99,64 @@ pub(crate) fn stats() -> bool {
     *V.get_or_init(|| flag("LICHII_DIAG_STATS"))
 }
 
+fn watch() -> &'static Mutex<Vec<(u64, Option<u64>)>> {
+    static V: OnceLock<Mutex<Vec<(u64, Option<u64>)>>> = OnceLock::new();
+    V.get_or_init(|| {
+        Mutex::new(
+            hex_list("LICHII_DIAG_WATCH")
+                .into_iter()
+                .map(|a| (a, None))
+                .collect(),
+        )
+    })
+}
+
+/// Resolves the device addresses of the watched GPU addresses that `gmmu` maps.
+pub(crate) fn watch_resolve(gmmu: &lichii_gpu::gmmu::Gmmu) {
+    let Ok(mut list) = watch().lock() else {
+        return;
+    };
+    for (gpu, dev) in list.iter_mut() {
+        if dev.is_none() {
+            *dev = gmmu.translate(*gpu);
+            if let Some(d) = *dev {
+                let text = format!("WATCH resolve gpu={gpu:#x} dev={d:#x}");
+                with(|s| s.event(&text));
+            }
+        }
+    }
+}
+
+fn watch_hit(kind: &str, addr: u64, size: u64, device: bool, extra: &str) {
+    let Ok(list) = watch().lock() else {
+        return;
+    };
+    let end = addr.saturating_add(size.max(1));
+    for &(gpu, dev) in list.iter() {
+        let target = if device { dev } else { Some(gpu) };
+        if let Some(t) = target
+            && t + 16 > addr
+            && t < end
+        {
+            let text = format!(
+                "WATCH {kind} watch={gpu:#x} {}={addr:#x}/{size:#x} {extra}",
+                if device { "dev" } else { "gpu" }
+            );
+            with(|s| s.event(&text));
+        }
+    }
+}
+
+/// Logs a GPU-address write or read that touches a watched address.
+pub(crate) fn watch_gpu(kind: &str, addr: u64, size: u64, extra: &str) {
+    watch_hit(kind, addr, size, false, extra);
+}
+
+/// Logs a device-address operation that touches a watched address.
+pub(crate) fn watch_dev(kind: &str, daddr: u64, size: u64) {
+    watch_hit(kind, daddr, size, true, "");
+}
+
 pub(crate) fn state() -> Option<&'static Mutex<DrawDiag>> {
     static STATE: OnceLock<Option<Mutex<DrawDiag>>> = OnceLock::new();
     STATE
