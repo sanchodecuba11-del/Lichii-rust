@@ -357,7 +357,11 @@ mod faults {
             "tracking and protect keep it inaccessible"
         );
         space.map(0x5000_0000, 0x10_0000, 0x1000, MemoryPermission::READ_WRITE);
-        assert_eq!(load(base, 0x5000_0008), 0xdead, "so is a new alias");
+        assert_eq!(
+            load(base, 0x5000_0008),
+            if cfg!(windows) { 7 } else { 0xdead },
+            "a new alias is trapped too, except where its view is briefly accessible: there the              map writes the page back first, which with no handler only disarms it"
+        );
 
         device.disarm_flush_traps(0x1_0000_0000, 0x1000);
         assert_eq!(load(base, 0x4000_0008), 7, "disarmed, it reads again");
