@@ -12,7 +12,7 @@ use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use super::super::ir::{Loc, Op, Ty, Value, W};
 use super::super::translate::Translator;
 use super::super::x64::{CTX_FPSR, Emitter, ST_SCRATCH};
-use super::ir::SimdOp;
+use super::ir::{Fp, SimdOp};
 use crate::decoder::{Inst, PostIndex, Reg};
 
 const SCRATCH: u8 = 15;
@@ -182,6 +182,24 @@ pub enum VecOp {
         shift: u8,
         a: Value,
     },
+    /// `SRSHR`/`URSHR` by `shift` (1 to the lane width): each lane of `a` shifted right,
+    /// arithmetically when `signed`, rounding to nearest with halves up; `SRSRA`/`URSRA` when
+    /// `acc` is given, which adds the result to it.
+    RoundShift {
+        signed: bool,
+        arrangement: Arrangement,
+        shift: u8,
+        acc: Option<Value>,
+        a: Value,
+    },
+    /// `MLA` (`acc + n * m`) or `MLS` (`acc - n * m`, when `sub`) on H or S lanes.
+    MulAcc {
+        sub: bool,
+        arrangement: Arrangement,
+        acc: Value,
+        n: Value,
+        m: Value,
+    },
     /// `USHL` on S or D lanes: each lane of `n` shifted by the signed low byte of `m`'s lane, left
     /// when it is positive and logically right when negative, giving zero from the lane width on.
     Ushl(Arrangement, Value, Value),
@@ -220,7 +238,7 @@ impl VecOp {
                 f(a);
                 f(b);
             }
-            VecOp::Select { old, n, m, .. } => {
+            VecOp::Select { old, n, m, .. } | VecOp::MulAcc { acc: old, n, m, .. } => {
                 f(old);
                 f(n);
                 f(m);
@@ -231,6 +249,12 @@ impl VecOp {
             | VecOp::Cnt(_, a)
             | VecOp::Extract { vector: a, .. }
             | VecOp::ShiftLong { a, .. } => f(a),
+            VecOp::RoundShift { acc, a, .. } => {
+                if let Some(acc) = acc {
+                    f(acc);
+                }
+                f(a);
+            }
             VecOp::Imm(..) => {}
         }
     }
@@ -291,6 +315,38 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     if word & 0xbf20_fc00 == 0x2e20_4400 && t.avx2 && (size == 2 || (size == 3 && q)) {
         let (n, m) = (vec(t, rn), vec(t, rm));
         let r = emit(t, VecOp::Ushl(arrangement, n, m));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0x9f20_fc00 == 0x0e20_9400 && supported(t, Binary::Mul, size) {
+        let (acc, n, m) = (vec(t, rd), vec(t, rn), vec(t, rm));
+        let r = emit(
+            t,
+            VecOp::MulAcc {
+                sub: u,
+                arrangement,
+                acc,
+                n,
+                m,
+            },
+        );
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbfff_fc00 == 0x2e20_5800 {
+        let a = vec(t, rn);
+        let zero = emit(t, VecOp::Imm(0, true));
+        let r = emit(t, VecOp::Binary(Binary::Orn, arrangement, zero, a));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0x9ff8_fc00 == 0x0f00_f400 && (!u || q) {
+        let imm8 = field(word, 16, 3) << 5 | field(word, 5, 5);
+        let imm = match u {
+            false => super::translate::expand_imm(Fp::S, imm8) * 0x1_0000_0001,
+            true => super::translate::expand_imm(Fp::D, imm8),
+        };
+        let r = emit(t, VecOp::Imm(imm, q));
         t.set(Loc::V(rd), r);
         return true;
     }
@@ -438,7 +494,24 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             t.set(Loc::V(rd), r);
             return true;
         }
-        let (op, amount) = match (field(word, 11, 5), u) {
+        let opcode = field(word, 11, 5);
+        if matches!(opcode, 0b00100 | 0b00110) && size != 0 && (size < 3 || (u && q)) {
+            let a = vec(t, rn);
+            let acc = (opcode == 0b00110).then(|| vec(t, rd));
+            let r = emit(
+                t,
+                VecOp::RoundShift {
+                    signed: !u,
+                    arrangement: Arrangement { size, q },
+                    shift: 2 * esize - immhb,
+                    acc,
+                    a,
+                },
+            );
+            t.set(Loc::V(rd), r);
+            return true;
+        }
+        let (op, amount) = match (opcode, u) {
             (0b00000, false) => (Shift::Sshr, 2 * esize - immhb),
             (0b00000, true) => (Shift::Ushr, 2 * esize - immhb),
             (0b01010, false) => (Shift::Shl, immhb - esize),
@@ -871,6 +944,21 @@ impl Emitter<'_> {
         );
     }
 
+    /// Shifts each lane of `8 << size` bits of `xmm d` by `amount`; `Sshr` takes H and S lanes.
+    fn shift_imm(&mut self, op: Shift, size: u8, d: u8, amount: u8) {
+        let n = amount as i8;
+        match (op, size) {
+            (Shift::Shl, 1) => dynasm!(self.asm ; .arch x64 ; psllw Rx(d), n),
+            (Shift::Shl, 2) => dynasm!(self.asm ; .arch x64 ; pslld Rx(d), n),
+            (Shift::Shl, _) => dynasm!(self.asm ; .arch x64 ; psllq Rx(d), n),
+            (Shift::Ushr, 1) => dynasm!(self.asm ; .arch x64 ; psrlw Rx(d), n),
+            (Shift::Ushr, 2) => dynasm!(self.asm ; .arch x64 ; psrld Rx(d), n),
+            (Shift::Ushr, _) => dynasm!(self.asm ; .arch x64 ; psrlq Rx(d), n),
+            (Shift::Sshr, 1) => dynasm!(self.asm ; .arch x64 ; psraw Rx(d), n),
+            (Shift::Sshr, _) => dynasm!(self.asm ; .arch x64 ; psrad Rx(d), n),
+        }
+    }
+
     fn copy(&mut self, d: u8, s: u8) {
         dynasm!(self.asm ; .arch x64 ; movdqa Rx(d), Rx(s));
     }
@@ -1058,17 +1146,30 @@ impl Emitter<'_> {
                 let a = self.reg(a);
                 let d = self.def(v);
                 self.copy(d, a);
-                let n = amount as i8;
-                match (op, size) {
-                    (Shift::Shl, 1) => dynasm!(self.asm ; .arch x64 ; psllw Rx(d), n),
-                    (Shift::Shl, 2) => dynasm!(self.asm ; .arch x64 ; pslld Rx(d), n),
-                    (Shift::Shl, _) => dynasm!(self.asm ; .arch x64 ; psllq Rx(d), n),
-                    (Shift::Ushr, 1) => dynasm!(self.asm ; .arch x64 ; psrlw Rx(d), n),
-                    (Shift::Ushr, 2) => dynasm!(self.asm ; .arch x64 ; psrld Rx(d), n),
-                    (Shift::Ushr, _) => dynasm!(self.asm ; .arch x64 ; psrlq Rx(d), n),
-                    (Shift::Sshr, 1) => dynasm!(self.asm ; .arch x64 ; psraw Rx(d), n),
-                    (Shift::Sshr, _) => dynasm!(self.asm ; .arch x64 ; psrad Rx(d), n),
+                self.shift_imm(op, size, d, amount);
+                (d, q)
+            }
+            VecOp::RoundShift {
+                signed,
+                arrangement: Arrangement { size, q },
+                shift,
+                acc,
+                a,
+            } => {
+                let a = self.reg(a);
+                let acc = acc.map(|acc| self.reg(acc));
+                let d = self.def(v);
+                let esize = 8 << size;
+                self.copy(SCRATCH, a);
+                self.shift_imm(Shift::Shl, size, SCRATCH, esize - shift);
+                self.shift_imm(Shift::Ushr, size, SCRATCH, esize - 1);
+                if let Some(acc) = acc {
+                    self.sse(Sse::Add, size, SCRATCH, acc);
                 }
+                self.copy(d, a);
+                let op = if signed { Shift::Sshr } else { Shift::Ushr };
+                self.shift_imm(op, size, d, shift);
+                self.sse(Sse::Add, size, d, SCRATCH);
                 (d, q)
             }
             VecOp::ScalarDup {
@@ -1208,6 +1309,21 @@ impl Emitter<'_> {
                     dynasm!(self.asm ; .arch x64 ; punpcklqdq Rx(d), Rx(d));
                 }
                 return;
+            }
+            VecOp::MulAcc {
+                sub,
+                arrangement: Arrangement { size, q },
+                acc,
+                n,
+                m,
+            } => {
+                let (acc, n, m) = (self.reg(acc), self.reg(n), self.reg(m));
+                let d = self.def(v);
+                self.copy(SCRATCH, n);
+                self.sse(Sse::Mul, size, SCRATCH, m);
+                self.copy(d, acc);
+                self.sse(if sub { Sse::Sub } else { Sse::Add }, size, d, SCRATCH);
+                (d, q)
             }
             VecOp::Table { q, table, index } => {
                 let (table, index) = (self.reg(table), self.reg(index));

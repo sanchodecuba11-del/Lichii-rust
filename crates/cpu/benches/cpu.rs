@@ -203,6 +203,26 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 8,
     },
     Workload {
+        name: "simd round loop",
+        code: &[
+            0x4f03f607, // fmov v7.4s, #1.0
+            0x1e6f1009, // fmov d9, #1.5
+            0x4ea29420, // 1: mla v0.4s, v1.4s, v2.4s
+            0x4f302403, // srshr v3.4s, v0.4s, #16
+            0x4f303464, // srsra v4.4s, v3.4s, #16
+            0x6e205885, // not v5.16b, v4.16b
+            0x4ea0c8e6, // fcmgt v6.4s, v7.4s, #0.0
+            0x1e664128, // frinta d8, d9
+            0x1e64012a, // fcvtas w10, d9
+            0x8b0a016b, // add x11, x11, x10
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffee1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
+    },
+    Workload {
         name: "exclusive pair loop",
         code: &[
             0xc87f1823, // 1: ldxp x3, x6, [x1]

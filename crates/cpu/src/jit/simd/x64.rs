@@ -579,6 +579,29 @@ impl Emitter<'_> {
                 self.rax_to_low(fp, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
+            SimdOp::RoundInt { fp, a, word } => {
+                let a = self.reg(a);
+                let d = self.def(v);
+                let slow = self.checked(false, Some(Inputs::scalar(fp, &[a], false)));
+                match fp {
+                    Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss Rx(a), Rx(a)),
+                    Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd Rx(a), Rx(a)),
+                }
+                dynasm!(self.asm ; .arch x64 ; jp =>slow);
+                match word >> 15 & 7 {
+                    4 => self.round_away(fp, a),
+                    opcode => {
+                        let imm = [8, 10, 9, 11][opcode as usize];
+                        match fp {
+                            Fp::S => dynasm!(self.asm ; .arch x64 ; roundss xmm15, Rx(a), imm),
+                            Fp::D => dynasm!(self.asm ; .arch x64 ; roundsd xmm15, Rx(a), imm),
+                        }
+                    }
+                }
+                self.low_to_rax(fp, 15);
+                self.rax_to_low(fp, d);
+                self.finish_checked(i, slow, word, d, Ty::U128);
+            }
             SimdOp::Convert { fp, a, word } => {
                 let a = self.reg(a);
                 let d = self.def(v);
@@ -640,6 +663,10 @@ impl Emitter<'_> {
                 let slow = self.checked(true, Some(Inputs::scalar(fp, &[a], false)));
                 let src = match word >> 19 & 3 {
                     3 => a,
+                    0 if word & 1 << 18 != 0 => {
+                        self.round_away(fp, a);
+                        15
+                    }
                     rmode => {
                         let imm = [8, 10, 9][rmode as usize];
                         match fp {
@@ -724,6 +751,55 @@ impl Emitter<'_> {
             SimdOp::SatNarrow { size, n, low, .. } => self.sat_narrow(i, size, n, low),
             SimdOp::Vec(op) => self.vector(i, op),
             SimdOp::Lanes(lanes) => self.lanes(i, lanes),
+        }
+    }
+
+    /// `xmm15` = `a` rounded to an integer with ties away from zero: the truncation, plus one
+    /// with `a`'s sign when the dropped fraction `a - trunc(a)`, which is exact, is at least a
+    /// half. Infinities stay as they are; `a` must not be a NaN. Clobbers `rax`, `rcx` and the
+    /// state's scratch.
+    fn round_away(&mut self, fp: Fp, a: u8) {
+        let done = self.asm.new_dynamic_label();
+        match fp {
+            Fp::S => dynasm!(self.asm
+                ; .arch x64
+                ; roundss xmm15, Rx(a), 11
+                ; movss [r13 + ST_SCRATCH], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subss xmm15, [r13 + ST_SCRATCH]
+                ; movd eax, xmm15
+                ; movss xmm15, [r13 + ST_SCRATCH]
+                ; and eax, 0x7fff_ffff
+                ; cmp eax, 0x3f00_0000
+                ; jb =>done
+                ; movd ecx, Rx(a)
+                ; and ecx, 0x8000_0000u32 as i32
+                ; or ecx, 0x3f80_0000
+                ; mov [r13 + ST_SCRATCH + 4], ecx
+                ; addss xmm15, [r13 + ST_SCRATCH + 4]
+                ; =>done
+            ),
+            Fp::D => dynasm!(self.asm
+                ; .arch x64
+                ; roundsd xmm15, Rx(a), 11
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subsd xmm15, [r13 + ST_SCRATCH]
+                ; movq rax, xmm15
+                ; movsd xmm15, [r13 + ST_SCRATCH]
+                ; btr rax, 63
+                ; mov rcx, QWORD 0x3fe0_0000_0000_0000
+                ; cmp rax, rcx
+                ; jb =>done
+                ; movq rax, Rx(a)
+                ; shr rax, 63
+                ; shl rax, 63
+                ; mov rcx, QWORD 0x3ff0_0000_0000_0000
+                ; or rax, rcx
+                ; mov [r13 + ST_SCRATCH + 8], rax
+                ; addsd xmm15, [r13 + ST_SCRATCH + 8]
+                ; =>done
+            ),
         }
     }
 
