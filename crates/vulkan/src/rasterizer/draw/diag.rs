@@ -15,6 +15,7 @@ pub(crate) struct DrawDiag {
     from: Duration,
     to: Duration,
     seq: u64,
+    always: u32,
     pub active: bool,
     pub line: String,
 }
@@ -142,7 +143,7 @@ fn watch_hit(kind: &str, addr: u64, size: u64, device: bool, extra: &str) {
                 "WATCH {kind} watch={gpu:#x} {}={addr:#x}/{size:#x} {extra}",
                 if device { "dev" } else { "gpu" }
             );
-            with(|s| s.event(&text));
+            with(|s| s.always(&text));
         }
     }
 }
@@ -169,6 +170,7 @@ pub(crate) fn state() -> Option<&'static Mutex<DrawDiag>> {
                 from: secs("LICHII_DRAW_DIAG_FROM").unwrap_or(Duration::ZERO),
                 to: secs("LICHII_DRAW_DIAG_TO").unwrap_or(Duration::MAX),
                 seq: 0,
+                always: 0,
                 active: false,
                 line: String::new(),
             }))
@@ -201,6 +203,15 @@ impl DrawDiag {
     pub(crate) fn in_window(&self) -> bool {
         let t = now();
         t >= self.from && t <= self.to
+    }
+
+    /// Writes `text` whatever the window, up to a fixed number of lines.
+    pub(crate) fn always(&mut self, text: &str) {
+        if self.always < 20_000 {
+            self.always += 1;
+            let _ = writeln!(self.out, "{text} t={:.4}", now().as_secs_f64());
+            let _ = self.out.flush();
+        }
     }
 
     pub(crate) fn event(&mut self, text: &str) {
