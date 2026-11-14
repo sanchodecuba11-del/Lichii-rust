@@ -106,6 +106,11 @@ impl Workers {
         let count = std::thread::available_parallelism()
             .map_or(1, |n| n.get().saturating_sub(EMULATION_THREADS))
             .clamp(1, MAX_WORKERS);
+        let count = std::env::var("LICHII_SHADER_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(count);
+        tracing::info!("shader workers: {count}");
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue { jobs: Vec::new() }),
             ready: Condvar::new(),
