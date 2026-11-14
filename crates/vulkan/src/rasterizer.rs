@@ -435,6 +435,15 @@ impl VulkanRasterizer {
         })
         .flatten();
         if let Some((address, info, width, height)) = color_target {
+            draw::diag::with(|d| {
+                d.event(&format!(
+                    "CLEAR rt{index} addr={:#x} {width}x{height} fmt={:?} color={:?} mask={:#x} z={use_depth}",
+                    address,
+                    info.format,
+                    regs.clear_color,
+                    regs.color_mask[if regs.color_mask_common != 0 { 0 } else { index }].0,
+                ))
+            });
             let mask = regs.color_mask[if regs.color_mask_common != 0 {
                 0
             } else {
