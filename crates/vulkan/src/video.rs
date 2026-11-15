@@ -68,21 +68,27 @@ impl Vp9Decode {
 /// What `vkGetPhysicalDeviceVideoCapabilitiesKHR` reports for one decode profile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeCaps {
+    /// The smallest coded picture size, in pixels.
     pub min_extent: vk::Extent2D,
+    /// The largest coded picture size, in pixels.
     pub max_extent: vk::Extent2D,
-    /// Granularity of picture sizes and offsets in decode output and DPB images.
+    /// Granularity of picture sizes and offsets in decode output and DPB images, in pixels.
     pub picture_granularity: vk::Extent2D,
+    /// The most DPB slots (reference pictures plus the one being decoded) a session may have.
     pub max_dpb_slots: u32,
+    /// The most reference pictures one decode may read.
     pub max_active_references: u32,
-    /// Alignment of a picture's offset and size in the bitstream buffer.
+    /// Alignment of a picture's offset in the bitstream buffer, in bytes.
     pub bitstream_offset_alignment: u64,
+    /// Alignment of a picture's size in the bitstream buffer, in bytes.
     pub bitstream_size_alignment: u64,
     /// Decode output and the reference picture are the same image (one image per picture).
     pub dpb_and_output_coincide: bool,
     /// Decode output and the reference picture are separate images.
     pub dpb_and_output_distinct: bool,
-    /// Formats decode output images may have, and DPB images.
+    /// Formats decode output images may have.
     pub output_formats: Vec<vk::Format>,
+    /// Formats DPB (reference picture) images may have.
     pub dpb_formats: Vec<vk::Format>,
     /// The codec's `VK_STD_vulkan_video_codec_*_decode` version sessions are created with.
     pub std_header_version: u32,
@@ -99,18 +105,22 @@ impl DecodeCaps {
     }
 }
 
-/// The video decode queue family that decodes the most of `wanted`'s codec operations (the
-/// first of equals), from each family's flags and video codec operations; `None` when none
-/// decodes any of them.
+/// The video decode queue family other than `universal` that decodes the most of `wanted`'s
+/// codec operations (the first of equals), from each family's flags and video codec operations;
+/// `None` when none decodes any of them.
 pub(crate) fn decode_family(
     families: &[(vk::QueueFlags, vk::VideoCodecOperationFlagsKHR)],
     wanted: vk::VideoCodecOperationFlagsKHR,
+    universal: u32,
 ) -> Option<u32> {
     let mut best = None;
     let mut best_count = 0;
     for (index, (flags, operations)) in families.iter().enumerate() {
         let count = (*operations & wanted).as_raw().count_ones();
-        if flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR) && count > best_count {
+        if index as u32 != universal
+            && flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR)
+            && count > best_count
+        {
             best = Some(index as u32);
             best_count = count;
         }
@@ -395,8 +405,7 @@ impl VideoDevice {
         if vp9_ext {
             wanted |= vp9_std::DECODE_VP9;
         }
-        let family = decode_family(&queue_families(raw_instance, physical), wanted)
-            .filter(|&family| family != universal)?;
+        let family = decode_family(&queue_families(raw_instance, physical), wanted, universal)?;
         let av1 = av1_ext
             .then(|| av1_capabilities(&instance.entry, raw_instance, physical))
             .flatten();
@@ -544,10 +553,20 @@ mod tests {
             (vk::QueueFlags::VIDEO_DECODE_KHR, av1 | vp9_std::DECODE_VP9),
         ];
         let both = av1 | vp9_std::DECODE_VP9;
-        assert_eq!(decode_family(&families, av1), Some(3));
-        assert_eq!(decode_family(&families, both), Some(4));
-        assert_eq!(decode_family(&families, vp9_std::DECODE_VP9), Some(4));
-        assert_eq!(decode_family(&families[..3], av1), None);
+        assert_eq!(decode_family(&families, av1, 0), Some(3));
+        assert_eq!(decode_family(&families, both, 0), Some(4));
+        assert_eq!(decode_family(&families, vp9_std::DECODE_VP9, 0), Some(4));
+        assert_eq!(decode_family(&families[..3], av1, 0), None);
+    }
+
+    #[test]
+    fn the_universal_family_is_never_the_decode_family() {
+        let universal =
+            vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::VIDEO_DECODE_KHR;
+        let av1 = vk::VideoCodecOperationFlagsKHR::DECODE_AV1;
+        let families = [(universal, av1), (vk::QueueFlags::VIDEO_DECODE_KHR, av1)];
+        assert_eq!(decode_family(&families, av1, 0), Some(1));
+        assert_eq!(decode_family(&families[..1], av1, 0), None);
     }
 
     #[test]
