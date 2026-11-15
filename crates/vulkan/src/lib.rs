@@ -23,6 +23,9 @@ pub mod swapchain;
 pub mod texture_cache;
 pub mod video;
 mod video_av1;
+mod video_decode;
+mod video_vp9;
+mod vp9_std;
 
 pub use device::{Device, DeviceExtensions, DeviceFeatures, DeviceProperties, available_devices};
 pub use error::{Error, Result};
