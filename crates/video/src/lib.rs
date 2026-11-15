@@ -5,6 +5,7 @@
 //! FFmpeg is optional at runtime: without it [`Decoder::new`] fails with
 //! [`VideoError::Unavailable`] after one warning, and callers show black frames.
 
+pub mod av1;
 pub mod convert;
 mod decoder;
 mod ffmpeg;
