@@ -296,7 +296,9 @@ impl Device {
             return Err(Error::NoDevice);
         }
         let candidate = candidates.swap_remove(chosen);
-        Self::create(instance, candidate, surface.is_some())
+        let device = Self::create(instance, candidate, surface.is_some())?;
+        crate::video_av1::register(&device);
+        Ok(device)
     }
 
     fn create(

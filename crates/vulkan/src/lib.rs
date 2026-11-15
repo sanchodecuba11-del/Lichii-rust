@@ -22,6 +22,7 @@ pub mod staging;
 pub mod swapchain;
 pub mod texture_cache;
 pub mod video;
+mod video_av1;
 
 pub use device::{Device, DeviceExtensions, DeviceFeatures, DeviceProperties, available_devices};
 pub use error::{Error, Result};

@@ -56,6 +56,8 @@ pub struct Av1Decode {
     pub dpb_formats: Vec<vk::Format>,
     /// The queue applies AV1 film grain itself.
     pub film_grain: bool,
+    /// The `VK_STD_vulkan_video_codec_av1_decode` version sessions are created with.
+    pub std_header_version: u32,
 }
 
 impl Av1Decode {
@@ -183,6 +185,7 @@ pub(crate) fn av1_capabilities(
             caps.min_bitstream_buffer_offset_alignment,
             caps.min_bitstream_buffer_size_alignment,
         );
+        let std_header_version = caps.std_header_version.spec_version;
         let flags = decode.flags;
         Some(Av1Decode {
             max_level: av1.max_level,
@@ -200,6 +203,7 @@ pub(crate) fn av1_capabilities(
             output_formats: formats(vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR),
             dpb_formats: formats(vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR),
             film_grain,
+            std_header_version,
         })
     };
     query(true).or_else(|| query(false))
@@ -322,6 +326,7 @@ mod tests {
             output_formats: Vec::new(),
             dpb_formats: Vec::new(),
             film_grain: false,
+            std_header_version: 0,
         };
         assert_eq!(av1.level_name(), "2.0");
         av1.max_level = 13;
