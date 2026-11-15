@@ -157,7 +157,7 @@ const ATOMIC_OPS: [AtomicOp; 9] = [
 /// and the operation above it; the operands are in `scratch` and `scratch2`.
 extern "sysv64" fn atomic_slow(state: &mut JitState, addr: u64, pc: u64, info: u32) -> bool {
     let size = info as u8;
-    if addr & ((1 << size) - 1) != 0 {
+    if !crate::interpreter::atomic_alignment_ok(addr, 1 << size) {
         state.fault = Some(CpuFault::Alignment { pc, addr });
         return true;
     }
