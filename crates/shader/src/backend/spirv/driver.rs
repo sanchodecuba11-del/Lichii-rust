@@ -297,7 +297,10 @@ fn define_entry_point(ctx: &mut EmitContext<'_>, main: Word) {
         ShaderStage::VertexA | ShaderStage::VertexB => ExecutionModel::Vertex,
     };
     let info = &program.info;
+    // Compute only: warp-synchronous guest code lives there, and AMD's driver (amdvlk 2.0.416)
+    // crashes building some graphics pipelines whose shaders ask for it.
     if profile.support_maximal_reconvergence
+        && program.stage == ShaderStage::Compute
         && ctx.supports_subgroups()
         && (info.uses_subgroup_vote
             || info.uses_subgroup_invocation_id
