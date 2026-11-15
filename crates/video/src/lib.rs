@@ -11,6 +11,7 @@ pub mod convert;
 mod decoder;
 mod ffmpeg;
 pub mod nvdec;
+pub mod vp9;
 
 pub use decoder::{
     Codec, Color, Decoder, Frame, GpuStream, GpuVideo, Latency, Matrix, OwnedPicture, Picture,
