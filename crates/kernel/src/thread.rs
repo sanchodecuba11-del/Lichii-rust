@@ -118,6 +118,8 @@ pub struct Thread {
     lock_waiters: Mutex<Vec<LockWaiter>>,
     /// The owner of the mutex this thread waits for.
     lock_owner: Mutex<LockOwner>,
+    /// The thread's latest supervisor calls and service requests, for crash reports.
+    pub(crate) recorder: Mutex<crate::flight::Recorder>,
 }
 
 /// Link from a waiter to the owner it lends its priority to, for the waiter's wait `token`.
@@ -162,6 +164,7 @@ impl Thread {
             stack_top: new.stack_top,
             scheduler: new.scheduler,
             context: Mutex::new(context),
+            recorder: Mutex::new(crate::flight::Recorder::default()),
             sched: Mutex::new(Sched {
                 state: ThreadState::Created,
                 priority: new.priority,
