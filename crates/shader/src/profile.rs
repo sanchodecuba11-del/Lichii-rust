@@ -41,9 +41,9 @@ pub struct Profile {
     pub support_shuffle_relative: bool,
     pub support_quad_shuffles: bool,
     pub support_shader_quad_control: bool,
-    /// `SPV_KHR_maximal_reconvergence`: shaders using subgroup operations ask that diverged
-    /// invocations reconverge where the guest warp would, as NVIDIA's warp-synchronous code
-    /// (shuffles, votes, tensor ops) expects.
+    /// `SPV_KHR_maximal_reconvergence`: compute shaders using subgroup operations ask that
+    /// diverged invocations reconverge where the guest warp would, as NVIDIA's warp-synchronous
+    /// code (shuffles, votes, tensor ops) expects.
     pub support_maximal_reconvergence: bool,
     /// `VK_KHR_cooperative_matrix` multiplies 16x16x16 f16 matrices in 32-wide subgroups, and
     /// compute pipelines run in full 32-wide subgroups: HMMA.F16 of compute programs whose
