@@ -43,6 +43,7 @@ pub struct DeviceExtensions {
     pub line_rasterization: bool,
     pub shader_stencil_export: bool,
     pub maximal_reconvergence: bool,
+    pub cooperative_matrix: bool,
 }
 
 type ExtensionFlag = fn(&mut DeviceExtensions) -> &mut bool;
@@ -80,6 +81,7 @@ const OPTIONAL_EXTENSIONS: &[(&CStr, ExtensionFlag)] = &[
     (khr::shader_maximal_reconvergence::NAME, |e| {
         &mut e.maximal_reconvergence
     }),
+    (khr::cooperative_matrix::NAME, |e| &mut e.cooperative_matrix),
 ];
 
 /// Optional capabilities, after checking both the extension and its feature bits. Everything
@@ -145,6 +147,12 @@ pub struct DeviceFeatures {
     pub maximal_reconvergence: bool,
     /// `maxComputeWorkgroupSubgroups`, the most subgroups a workgroup may span at that size.
     pub max_compute_workgroup_subgroups: u32,
+    /// Compute pipelines of whole 32-lane warps can require full subgroups.
+    pub compute_full_subgroups: bool,
+    /// `VK_KHR_cooperative_matrix` multiplies 16x16x16 fp16 matrices in 32-wide subgroups, with
+    /// the Vulkan memory model: guest HMMA.F16 runs on the host's matrix cores.
+    /// Off with `LICHII_COOPERATIVE_HMMA=0`.
+    pub cooperative_hmma_16x16x16: bool,
 }
 
 /// Facts about the physical device the renderer needs at run time.
@@ -359,6 +367,7 @@ impl Device {
         let mut uint8 = vk::PhysicalDeviceIndexTypeUint8FeaturesKHR::default();
         let mut lines = vk::PhysicalDeviceLineRasterizationFeaturesKHR::default();
         let mut reconvergence = vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR::default();
+        let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
 
         macro_rules! chain {
             ($features:expr) => {{
@@ -379,6 +388,7 @@ impl Device {
                 uint8.p_next = std::ptr::null_mut();
                 lines.p_next = std::ptr::null_mut();
                 reconvergence.p_next = std::ptr::null_mut();
+                cooperative.p_next = std::ptr::null_mut();
                 let mut features = vk::PhysicalDeviceFeatures2::default()
                     .push_next(&mut v11)
                     .push_next(&mut v12)
@@ -424,6 +434,9 @@ impl Device {
                 }
                 if extensions.maximal_reconvergence {
                     features = features.push_next(&mut reconvergence);
+                }
+                if extensions.cooperative_matrix {
+                    features = features.push_next(&mut cooperative);
                 }
                 features.features = $features;
                 features
@@ -526,6 +539,8 @@ impl Device {
             maximal_reconvergence: extensions.maximal_reconvergence
                 && on(reconvergence.shader_maximal_reconvergence)
                 && std::env::var("LICHII_MAXIMAL_RECONVERGENCE").map_or(true, |v| v.trim() != "0"),
+            compute_full_subgroups: on(v13.compute_full_subgroups),
+            cooperative_hmma_16x16x16: false,
         };
         {
             let mut v13_properties = vk::PhysicalDeviceVulkan13Properties::default();
@@ -543,11 +558,37 @@ impl Device {
                     .contains(vk::ShaderStageFlags::COMPUTE);
             features.max_compute_workgroup_subgroups =
                 v13_properties.max_compute_workgroup_subgroups;
+            let shape_16x16x16 =
+                extensions.cooperative_matrix && on(cooperative.cooperative_matrix) && {
+                    let loader =
+                        khr::cooperative_matrix::Instance::new(&instance.entry, raw_instance);
+                    // SAFETY: a property query on a device that reports the extension.
+                    let shapes = unsafe {
+                        loader.get_physical_device_cooperative_matrix_properties(physical)
+                    }
+                    .unwrap_or_default();
+                    let half = vk::ComponentTypeKHR::FLOAT16;
+                    shapes.iter().any(|p| {
+                        (p.m_size, p.n_size, p.k_size) == (16, 16, 16)
+                            && (p.a_type, p.b_type, p.c_type, p.result_type)
+                                == (half, half, half, half)
+                            && p.saturating_accumulation == vk::FALSE
+                            && p.scope == vk::ScopeKHR::SUBGROUP
+                    })
+                };
+            features.cooperative_hmma_16x16x16 = shape_16x16x16
+                && features.compute_subgroup_32
+                && features.compute_full_subgroups
+                && on(v12.vulkan_memory_model)
+                && on(v12.vulkan_memory_model_device_scope)
+                && on(v12.shader_float16)
+                && std::env::var("LICHII_COOPERATIVE_HMMA").map_or(true, |v| v.trim() != "0");
             tracing::info!(
-                "compute shaders: {}-wide subgroups by default, 32-wide required: {}, maximal reconvergence: {}",
+                "compute shaders: {}-wide subgroups by default, 32-wide required: {}, maximal reconvergence: {}, HMMA on 16x16x16 cooperative matrices: {}",
                 v13_properties.max_subgroup_size,
                 features.compute_subgroup_32,
-                features.maximal_reconvergence
+                features.maximal_reconvergence,
+                features.cooperative_hmma_16x16x16
             );
         }
 

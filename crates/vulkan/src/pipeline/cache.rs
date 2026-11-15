@@ -749,6 +749,11 @@ impl Context {
             && invocations.div_ceil(32) <= features.max_compute_workgroup_subgroups
         {
             stage_info = stage_info.push_next(&mut subgroup_32);
+            // Whole warps run as whole subgroups, which cooperative-matrix HMMA needs.
+            if features.compute_full_subgroups && x.is_multiple_of(32) {
+                stage_info =
+                    stage_info.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+            }
         }
         let info = vk::ComputePipelineCreateInfo::default()
             .stage(stage_info)
