@@ -13,7 +13,7 @@ use lichii_video::av1::frame::{FrameHeader, FrameType, NUM_REF_FRAMES, REFS_PER_
 use lichii_video::av1::{Av1Stream, ParsedFrame, SequenceHeader};
 use lichii_video::{Codec, Color, GpuStream, Matrix, OwnedPicture, VideoError};
 
-use crate::device::Device;
+use crate::video::VideoDevice;
 use crate::video_decode::{CodecProfile, DecodeCore, MAX_SLOTS, Slot, check, zeroed};
 
 const STD_AV1_DECODE: &std::ffi::CStr = c"VK_STD_vulkan_video_codec_av1_decode";
@@ -37,7 +37,7 @@ pub(crate) struct Av1Decoder {
 }
 
 impl Av1Decoder {
-    pub(crate) fn new(device: Arc<Device>) -> Result<Self, VideoError> {
+    pub(crate) fn new(device: Arc<VideoDevice>) -> Result<Self, VideoError> {
         Ok(Self {
             parser: Av1Stream::default(),
             gpu: Gpu::new(device)?,
@@ -108,11 +108,11 @@ fn color(seq: &SequenceHeader) -> Color {
 }
 
 impl Gpu {
-    fn new(device: Arc<Device>) -> Result<Self, VideoError> {
+    fn new(device: Arc<VideoDevice>) -> Result<Self, VideoError> {
         let av1 = device
             .video
-            .as_ref()
-            .and_then(|video| video.av1.clone())
+            .av1
+            .clone()
             .ok_or(VideoError::NoDecoder(Codec::Av1))?;
         let profile = vk::VideoDecodeAV1ProfileInfoKHR::default()
             .std_profile(sv::StdVideoAV1Profile_STD_VIDEO_AV1_PROFILE_MAIN)

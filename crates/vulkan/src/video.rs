@@ -323,6 +323,205 @@ impl VideoQueue {
     }
 }
 
+/// Extensions `LICHII_VULKAN_DISABLE` names (whole names or parts, comma-separated, lower case):
+/// devices do not enable them, to find which one a driver problem comes from.
+pub(crate) fn disabled_extensions() -> Vec<String> {
+    std::env::var("LICHII_VULKAN_DISABLE")
+        .map(|list| {
+            list.split(',')
+                .map(|name| name.trim().to_ascii_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A logical device of its own for video decoding: the video queue, and one queue of the
+/// universal family that copies decoded pictures out. The renderer's device enables no video
+/// extension, so they cannot change how the driver builds the title's pipelines (AMD's driver
+/// refuses some geometry pipelines once `VK_KHR_video_decode_vp9` is enabled beside them).
+pub struct VideoDevice {
+    pub(crate) raw: ash::Device,
+    pub(crate) instance: std::sync::Arc<crate::instance::Instance>,
+    pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// The universal family, whose queue here copies pictures out.
+    pub transfer_family: u32,
+    transfer_queue: Mutex<vk::Queue>,
+    /// The video decode queue and what it decodes.
+    pub video: VideoQueue,
+}
+
+impl VideoDevice {
+    /// The video device of `physical`, when it has a decode queue family other than `universal`
+    /// that decodes AV1 or VP9.
+    pub(crate) fn new(
+        instance: &std::sync::Arc<crate::instance::Instance>,
+        physical: vk::PhysicalDevice,
+        universal: u32,
+    ) -> Option<std::sync::Arc<Self>> {
+        let raw_instance = &instance.raw;
+        // SAFETY: a valid physical device of this instance.
+        let available =
+            unsafe { raw_instance.enumerate_device_extension_properties(physical) }.ok()?;
+        let disabled = disabled_extensions();
+        let has = |name: &CStr| {
+            let lower = name.to_string_lossy().to_ascii_lowercase();
+            !disabled.iter().any(|d| lower.contains(d.as_str()))
+                && available
+                    .iter()
+                    .any(|e| e.extension_name_as_c_str() == Ok(name))
+        };
+        if !DECODE_EXTENSIONS.iter().all(|name| has(name)) {
+            tracing::info!("Vulkan video: no video decode queue extensions");
+            return None;
+        }
+        let av1_ext = has(khr::video_decode_av1::NAME);
+        let mut vp9_feature = vp9_std::PhysicalDeviceVideoDecodeVp9Features::default();
+        if has(vp9_std::EXTENSION_NAME) {
+            let mut query = vk::PhysicalDeviceFeatures2 {
+                p_next: (&mut vp9_feature as *mut vp9_std::PhysicalDeviceVideoDecodeVp9Features)
+                    .cast(),
+                ..Default::default()
+            };
+            // SAFETY: a feature query whose chain is one structure of an extension the device
+            // reports.
+            unsafe { raw_instance.get_physical_device_features2(physical, &mut query) };
+        }
+        let vp9_ext = vp9_feature.video_decode_vp9 == vk::TRUE;
+        let mut wanted = vk::VideoCodecOperationFlagsKHR::empty();
+        if av1_ext {
+            wanted |= vk::VideoCodecOperationFlagsKHR::DECODE_AV1;
+        }
+        if vp9_ext {
+            wanted |= vp9_std::DECODE_VP9;
+        }
+        let family = decode_family(&queue_families(raw_instance, physical), wanted)
+            .filter(|&family| family != universal)?;
+        let av1 = av1_ext
+            .then(|| av1_capabilities(&instance.entry, raw_instance, physical))
+            .flatten();
+        let vp9 = vp9_ext
+            .then(|| vp9_capabilities(&instance.entry, raw_instance, physical))
+            .flatten();
+        if av1.is_none() && vp9.is_none() {
+            return None;
+        }
+
+        let mut names: Vec<*const std::ffi::c_char> =
+            DECODE_EXTENSIONS.iter().map(|name| name.as_ptr()).collect();
+        if av1.is_some() {
+            names.push(khr::video_decode_av1::NAME.as_ptr());
+        }
+        if vp9.is_some() {
+            names.push(vp9_std::EXTENSION_NAME.as_ptr());
+        }
+        let priorities = [1.0];
+        let queues = [
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(universal)
+                .queue_priorities(&priorities),
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(family)
+                .queue_priorities(&priorities),
+        ];
+        let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
+        let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut supported = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut v11)
+            .push_next(&mut v13);
+        // SAFETY: a feature query with core structures.
+        unsafe { raw_instance.get_physical_device_features2(physical, &mut supported) };
+        let (ycbcr, sync2) = (v11.sampler_ycbcr_conversion, v13.synchronization2);
+        if sync2 != vk::TRUE {
+            return None;
+        }
+        let mut enable11 = vk::PhysicalDeviceVulkan11Features::default()
+            .sampler_ycbcr_conversion(ycbcr == vk::TRUE);
+        let mut enable13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true);
+        let enable_vp9 = vp9_std::PhysicalDeviceVideoDecodeVp9Features {
+            video_decode_vp9: vk::TRUE,
+            ..Default::default()
+        };
+        let mut info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queues)
+            .enabled_extension_names(&names)
+            .push_next(&mut enable11)
+            .push_next(&mut enable13);
+        let mut enable_vp9 = enable_vp9;
+        if vp9.is_some() {
+            enable_vp9.p_next = info.p_next.cast_mut();
+            info.p_next =
+                (&enable_vp9 as *const vp9_std::PhysicalDeviceVideoDecodeVp9Features).cast();
+        }
+        // SAFETY: the extensions and features requested were all reported by the device.
+        let raw = match unsafe { raw_instance.create_device(physical, &info, None) } {
+            Ok(raw) => raw,
+            Err(error) => {
+                tracing::warn!("Vulkan video: creating the video device failed: {error}");
+                return None;
+            }
+        };
+        // SAFETY: the device was created with one queue of each family.
+        let (transfer_queue, video_queue, memory_properties) = unsafe {
+            (
+                raw.get_device_queue(universal, 0),
+                raw.get_device_queue(family, 0),
+                raw_instance.get_physical_device_memory_properties(physical),
+            )
+        };
+        let reports = [
+            ("AV1", av1.as_ref().map(|c| (&c.caps, c.level_name()))),
+            ("VP9", vp9.as_ref().map(|c| (&c.caps, c.level_name()))),
+        ];
+        for (codec, report) in reports {
+            if let Some((caps, level)) = report {
+                tracing::info!(
+                    "Vulkan video: {codec} decode on queue family {family} of the video device: \
+                     4:2:0 8-bit up to {}x{}, level {level}, {} DPB slots, {} references, DPB \
+                     and output {}, output formats {:?}",
+                    caps.max_extent.width,
+                    caps.max_extent.height,
+                    caps.max_dpb_slots,
+                    caps.max_active_references,
+                    caps.dpb_and_output(),
+                    caps.output_formats,
+                );
+            }
+        }
+        Some(std::sync::Arc::new(Self {
+            raw,
+            instance: instance.clone(),
+            memory_properties,
+            transfer_family: universal,
+            transfer_queue: Mutex::new(transfer_queue),
+            video: VideoQueue::new(family, video_queue, av1, vp9),
+        }))
+    }
+
+    /// Submits to the copy queue.
+    pub(crate) fn submit(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), vk::Result> {
+        let queue = self.transfer_queue.lock();
+        // SAFETY: the queue is externally synchronised by the lock; the caller keeps every
+        // referenced object alive until the submission completes.
+        unsafe { self.raw.queue_submit2(*queue, submits, fence) }
+    }
+}
+
+impl Drop for VideoDevice {
+    fn drop(&mut self) {
+        // SAFETY: decoders hold an `Arc` of this device, so none is left, and every submission
+        // of theirs was waited for.
+        unsafe {
+            let _ = self.raw.device_wait_idle();
+            self.raw.destroy_device(None);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +574,8 @@ mod tests {
             eprintln!("skipping: no video decode queue");
             return;
         };
+        assert_eq!(video.transfer_family, device.queue_family());
+        let video = &video.video;
         assert_ne!(video.family, device.queue_family());
         let all = video.av1.iter().map(|av1| &av1.caps);
         for caps in all.chain(video.vp9.iter().map(|vp9| &vp9.caps)) {

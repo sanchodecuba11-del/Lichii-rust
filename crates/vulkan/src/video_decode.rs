@@ -14,8 +14,7 @@ use std::sync::{Arc, Weak};
 use ash::{khr, vk};
 use lichii_video::{Codec, Color, GpuStream, GpuVideo, OwnedPicture, VideoError};
 
-use crate::device::Device;
-use crate::video::DecodeCaps;
+use crate::video::{DecodeCaps, VideoDevice};
 use crate::vp9_std;
 
 pub(crate) const NV12: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
@@ -24,13 +23,13 @@ pub(crate) const MAX_SLOTS: u32 = 9;
 
 /// The host GPU's video decoders, as `lichii_video` sees them.
 struct VulkanVideo {
-    device: Weak<Device>,
+    device: Weak<VideoDevice>,
 }
 
 impl GpuVideo for VulkanVideo {
     fn open(&self, codec: Codec) -> Option<Box<dyn GpuStream>> {
         let device = self.device.upgrade()?;
-        let video = device.video.as_ref()?;
+        let video = &device.video;
         let opened: Result<Box<dyn GpuStream>, VideoError> = match codec {
             Codec::Av1 if video.av1.is_some() => {
                 crate::video_av1::Av1Decoder::new(device).map(|d| Box::new(d) as _)
@@ -51,10 +50,10 @@ impl GpuVideo for VulkanVideo {
 }
 
 /// Makes `device`'s video queue decode for `lichii_video` decoders opened from now on.
-pub(crate) fn register(device: &Arc<Device>) {
-    if device.video.is_some() {
+pub(crate) fn register(device: &crate::device::Device) {
+    if let Some(video) = &device.video {
         lichii_video::set_gpu_video(Some(Arc::new(VulkanVideo {
-            device: Arc::downgrade(device),
+            device: Arc::downgrade(video),
         })));
     }
 }
@@ -120,7 +119,7 @@ pub(crate) struct Slot {
 
 /// The Vulkan side of one stream.
 pub(crate) struct DecodeCore {
-    device: Arc<Device>,
+    device: Arc<VideoDevice>,
     video_queue: khr::video_queue::Device,
     video_decode: khr::video_decode_queue::Device,
     family: u32,
@@ -153,7 +152,7 @@ pub(crate) struct DecodeCore {
 unsafe impl Send for DecodeCore {}
 
 fn memory_type(
-    device: &Device,
+    device: &VideoDevice,
     bits: u32,
     need: vk::MemoryPropertyFlags,
     prefer: vk::MemoryPropertyFlags,
@@ -170,7 +169,7 @@ fn memory_type(
 }
 
 fn allocate(
-    device: &Device,
+    device: &VideoDevice,
     requirements: vk::MemoryRequirements,
     need: vk::MemoryPropertyFlags,
     prefer: vk::MemoryPropertyFlags,
@@ -189,7 +188,7 @@ impl DecodeCore {
     /// The core of a stream of `codec`, whose decode capabilities are `caps` and whose std
     /// header is `std_name`; at most `max_references` references a picture.
     pub(crate) fn new(
-        device: Arc<Device>,
+        device: Arc<VideoDevice>,
         codec: CodecProfile,
         caps: &DecodeCaps,
         std_name: &'static CStr,
@@ -199,9 +198,7 @@ impl DecodeCore {
             CodecProfile::Av1(_) => vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
             CodecProfile::Vp9(_) => vp9_std::DECODE_VP9,
         };
-        let video = device.video.as_ref().ok_or(VideoError::Gpu(
-            vk::Result::ERROR_FEATURE_NOT_PRESENT.as_raw(),
-        ))?;
+        let video = &device.video;
         let raw = &device.raw;
         let video_queue = khr::video_queue::Device::new(&device.instance.raw, raw);
         let video_decode = khr::video_decode_queue::Device::new(&device.instance.raw, raw);
@@ -220,7 +217,7 @@ impl DecodeCore {
             Ok::<_, VideoError>((pool, cmd))
         };
         let (video_pool, video_cmd) = pool(video.family)?;
-        let (main_pool, main_cmd) = pool(device.queue_family())?;
+        let (main_pool, main_cmd) = pool(device.transfer_family)?;
         // SAFETY: plain object creation on a live device.
         let (video_fence, main_fence, decoded) = unsafe {
             (
@@ -261,7 +258,7 @@ impl DecodeCore {
         })
     }
 
-    pub(crate) fn device(&self) -> &Device {
+    pub(crate) fn device(&self) -> &VideoDevice {
         &self.device
     }
 
@@ -536,7 +533,7 @@ impl DecodeCore {
         let out = self.image(
             extent,
             vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR | vk::ImageUsageFlags::TRANSFER_SRC,
-            &[self.family, self.device.queue_family()],
+            &[self.family, self.device.transfer_family],
         )?;
         self.session = Some(Session {
             raw: session,
@@ -723,8 +720,7 @@ impl DecodeCore {
             let submit = vk::SubmitInfo2::default()
                 .command_buffer_infos(&cmds)
                 .signal_semaphore_infos(&signals);
-            let video = self.device.video.as_ref().expect("checked at open");
-            let queue = video.queue();
+            let queue = self.device.video.queue();
             raw.queue_submit2(*queue, &[submit], self.video_fence)
                 .map_err(vk_error)?;
         }
@@ -851,7 +847,7 @@ impl DecodeCore {
             }
             self.device
                 .submit(&[submit], self.main_fence)
-                .map_err(|_| VideoError::Gpu(vk::Result::ERROR_DEVICE_LOST.as_raw()))?;
+                .map_err(vk_error)?;
             let mut fences = vec![self.main_fence];
             if after_decode {
                 fences.push(self.video_fence);

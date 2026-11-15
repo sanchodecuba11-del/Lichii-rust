@@ -15,8 +15,7 @@ use lichii_shader::profile::HostTranslateInfo;
 use crate::error::{Error, Result, VkResultExt};
 use crate::instance::Instance;
 use crate::profile::{ShaderQueries, shader_profile};
-use crate::video::{self, VideoQueue};
-use crate::vp9_std;
+use crate::video;
 
 /// Device memory blocks are 64 MiB: with 256 MiB blocks ~38% of device memory sat empty in
 /// half-used blocks and evictions never lowered the driver's usage (NX2_NOTES row 114).
@@ -177,7 +176,7 @@ pub struct Device {
     /// Debug names and labels, with `debug.vulkan_labels`.
     pub(crate) labels: Option<ext::debug_utils::Device>,
     /// The video decode queue, when the device decodes AV1 or VP9 on one of its own.
-    pub video: Option<VideoQueue>,
+    pub video: Option<Arc<video::VideoDevice>>,
 }
 
 struct Candidate {
@@ -315,7 +314,13 @@ impl Device {
                 .enumerate_device_extension_properties(physical)
                 .call("vkEnumerateDeviceExtensionProperties")?
         };
+        let disabled = video::disabled_extensions();
         let has = |name: &CStr| {
+            let lower = name.to_string_lossy().to_ascii_lowercase();
+            if disabled.iter().any(|d| lower.contains(d.as_str())) {
+                tracing::info!("Vulkan: {} not enabled (LICHII_VULKAN_DISABLE)", lower);
+                return false;
+            }
             available
                 .iter()
                 .any(|e| e.extension_name_as_c_str() == Ok(name))
@@ -334,42 +339,6 @@ impl Device {
                 names.push(name.as_ptr());
             }
         }
-        // A queue family of its own that decodes AV1 or VP9: movies decode on the video engine.
-        let video_base = video::DECODE_EXTENSIONS.iter().all(|name| has(name));
-        let av1_decode = video_base && has(khr::video_decode_av1::NAME);
-        let mut vp9_feature = vp9_std::PhysicalDeviceVideoDecodeVp9Features::default();
-        if video_base && has(vp9_std::EXTENSION_NAME) {
-            let mut query = vk::PhysicalDeviceFeatures2 {
-                p_next: (&mut vp9_feature as *mut vp9_std::PhysicalDeviceVideoDecodeVp9Features)
-                    .cast(),
-                ..Default::default()
-            };
-            // SAFETY: a feature query whose chain is one structure of an extension the device
-            // reports.
-            unsafe { raw_instance.get_physical_device_features2(physical, &mut query) };
-        }
-        let vp9_decode = vp9_feature.video_decode_vp9 == vk::TRUE;
-        let mut wanted = vk::VideoCodecOperationFlagsKHR::empty();
-        if av1_decode {
-            wanted |= vk::VideoCodecOperationFlagsKHR::DECODE_AV1;
-        }
-        if vp9_decode {
-            wanted |= vp9_std::DECODE_VP9;
-        }
-        let video_family = (!wanted.is_empty())
-            .then(|| video::decode_family(&video::queue_families(raw_instance, physical), wanted))
-            .flatten()
-            .filter(|&family| family != candidate.queue_family);
-        if video_family.is_some() {
-            names.extend(video::DECODE_EXTENSIONS.iter().map(|name| name.as_ptr()));
-            if av1_decode {
-                names.push(khr::video_decode_av1::NAME.as_ptr());
-            }
-            if vp9_decode {
-                names.push(vp9_std::EXTENSION_NAME.as_ptr());
-            }
-        }
-
         let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
@@ -571,18 +540,9 @@ impl Device {
         );
 
         let priorities = [1.0];
-        let mut queue_info = vec![
-            vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(candidate.queue_family)
-                .queue_priorities(&priorities),
-        ];
-        if let Some(family) = video_family {
-            queue_info.push(
-                vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(family)
-                    .queue_priorities(&priorities),
-            );
-        }
+        let queue_info = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(candidate.queue_family)
+            .queue_priorities(&priorities)];
         let mut enabled = chain!(core);
         let mut info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
@@ -592,15 +552,6 @@ impl Device {
             info = info
                 .push_next(&mut diagnostics_features)
                 .push_next(&mut diagnostics);
-        }
-        let mut vp9_enable = vp9_std::PhysicalDeviceVideoDecodeVp9Features {
-            video_decode_vp9: vk::TRUE,
-            ..Default::default()
-        };
-        if video_family.is_some() && vp9_decode {
-            vp9_enable.p_next = info.p_next.cast_mut();
-            info.p_next =
-                (&vp9_enable as *const vp9_std::PhysicalDeviceVideoDecodeVp9Features).cast();
         }
         // SAFETY: the extensions and features requested were all reported by the device.
         let raw = unsafe {
@@ -688,55 +639,7 @@ impl Device {
             }
         };
 
-        let video = video_family.and_then(|family| {
-            let av1 = av1_decode
-                .then(|| video::av1_capabilities(&instance.entry, raw_instance, physical))
-                .flatten();
-            let vp9 = vp9_decode
-                .then(|| video::vp9_capabilities(&instance.entry, raw_instance, physical))
-                .flatten();
-            if av1.is_none() && vp9.is_none() {
-                return None;
-            }
-            if let Some(av1) = &av1 {
-                let caps = &av1.caps;
-                tracing::info!(
-                    "Vulkan video: AV1 decode on queue family {family}: Main 4:2:0 8-bit up to \
-                     {}x{}, level {}, {} DPB slots, {} references, film grain {}, DPB and output \
-                     {}, output formats {:?}",
-                    caps.max_extent.width,
-                    caps.max_extent.height,
-                    av1.level_name(),
-                    caps.max_dpb_slots,
-                    caps.max_active_references,
-                    if av1.film_grain {
-                        "on the GPU"
-                    } else {
-                        "not applied"
-                    },
-                    caps.dpb_and_output(),
-                    caps.output_formats,
-                );
-            }
-            if let Some(vp9) = &vp9 {
-                let caps = &vp9.caps;
-                tracing::info!(
-                    "Vulkan video: VP9 decode on queue family {family}: profile 0 up to {}x{}, \
-                     level {}, {} DPB slots, {} references, DPB and output {}, output formats \
-                     {:?}",
-                    caps.max_extent.width,
-                    caps.max_extent.height,
-                    vp9.level_name(),
-                    caps.max_dpb_slots,
-                    caps.max_active_references,
-                    caps.dpb_and_output(),
-                    caps.output_formats,
-                );
-            }
-            // SAFETY: the device was created with one queue of this family.
-            let queue = unsafe { raw.get_device_queue(family, 0) };
-            Some(VideoQueue::new(family, queue, av1, vp9))
-        });
+        let video = video::VideoDevice::new(&instance, physical, candidate.queue_family);
         if video.is_none() {
             tracing::info!("Vulkan video: no AV1 or VP9 decode queue on this device");
         }

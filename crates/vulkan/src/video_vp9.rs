@@ -13,7 +13,7 @@ use lichii_video::vp9::{
 };
 use lichii_video::{Codec, Color, GpuStream, Matrix, OwnedPicture, VideoError};
 
-use crate::device::Device;
+use crate::video::VideoDevice;
 use crate::video_decode::{CodecProfile, DecodeCore, MAX_SLOTS, Slot};
 use crate::vp9_std::{
     self, StdVideoDecodeVP9PictureInfo, StdVideoVP9ColorConfig, StdVideoVP9LoopFilter,
@@ -36,11 +36,11 @@ pub(crate) struct Vp9Decoder {
 }
 
 impl Vp9Decoder {
-    pub(crate) fn new(device: Arc<Device>) -> Result<Self, VideoError> {
+    pub(crate) fn new(device: Arc<VideoDevice>) -> Result<Self, VideoError> {
         let vp9 = device
             .video
-            .as_ref()
-            .and_then(|video| video.vp9.clone())
+            .vp9
+            .clone()
             .ok_or(VideoError::NoDecoder(Codec::Vp9))?;
         let core = DecodeCore::new(
             device,
@@ -329,7 +329,8 @@ mod tests {
                 return;
             }
         };
-        let device = match Device::new(instance, &GraphicsSettings::default(), None) {
+        let device = match crate::device::Device::new(instance, &GraphicsSettings::default(), None)
+        {
             Ok(device) => device,
             Err(error) => {
                 eprintln!("skipping: {error}");
@@ -339,13 +340,14 @@ mod tests {
         let fits = device
             .video
             .as_ref()
-            .and_then(|v| v.vp9.as_ref())
+            .and_then(|v| v.video.vp9.as_ref())
             .is_some_and(|vp9| vp9.caps.min_extent.width <= 64 && vp9.caps.min_extent.height <= 48);
         if !fits {
             eprintln!("skipping: no VP9 decode queue for 64x48 pictures");
             return;
         }
-        let mut decoder = Vp9Decoder::new(device).unwrap();
+        let video = device.video.clone().expect("checked above");
+        let mut decoder = Vp9Decoder::new(video).unwrap();
         let stream = include_bytes!("../../video/tests/data/quadrants.vp9.ivf");
         let mut pictures = Vec::new();
         for (pts, packet) in ivf_frames(stream).into_iter().enumerate() {
