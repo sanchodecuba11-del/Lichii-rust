@@ -335,9 +335,13 @@ impl Device {
         let video_family = video::AV1_EXTENSIONS
             .iter()
             .all(|name| has(name))
-            .then(|| video::decode_family(&video::queue_families(raw_instance, physical)))
-            .flatten()
-            .filter(|&family| family != candidate.queue_family);
+            .then(|| {
+                video::decode_family(
+                    &video::queue_families(raw_instance, physical),
+                    candidate.queue_family,
+                )
+            })
+            .flatten();
         if video_family.is_some() {
             names.extend(video::AV1_EXTENSIONS.iter().map(|name| name.as_ptr()));
         }
@@ -766,7 +770,9 @@ impl Device {
     /// Blocks until the device finished all work.
     pub fn wait_idle(&self) {
         let _queue = self.queue.lock();
-        // SAFETY: holding the queue lock keeps other threads from submitting meanwhile.
+        let _video = self.video.as_ref().map(|video| video.queue());
+        // SAFETY: holding the universal and video queue locks (in that order, as everywhere)
+        // keeps other threads from submitting to any queue of the device meanwhile.
         if let Err(error) = unsafe { self.raw.device_wait_idle() } {
             tracing::error!("vkDeviceWaitIdle: {error}");
         }

@@ -32,21 +32,27 @@ pub struct VideoQueue {
 pub struct Av1Decode {
     /// The highest AV1 level, as `StdVideoAV1Level` (0 is level 2.0, each step a minor level).
     pub max_level: u32,
+    /// The smallest coded picture size, in pixels.
     pub min_extent: vk::Extent2D,
+    /// The largest coded picture size, in pixels.
     pub max_extent: vk::Extent2D,
-    /// Granularity of picture sizes and offsets in decode output and DPB images.
+    /// Granularity of picture sizes and offsets in decode output and DPB images, in pixels.
     pub picture_granularity: vk::Extent2D,
+    /// The most DPB slots (reference pictures plus the one being decoded) a session may have.
     pub max_dpb_slots: u32,
+    /// The most reference pictures one decode may read.
     pub max_active_references: u32,
-    /// Alignment of a picture's offset and size in the bitstream buffer.
+    /// Alignment of a picture's offset in the bitstream buffer, in bytes.
     pub bitstream_offset_alignment: u64,
+    /// Alignment of a picture's size in the bitstream buffer, in bytes.
     pub bitstream_size_alignment: u64,
     /// Decode output and the reference picture are the same image (one image per picture).
     pub dpb_and_output_coincide: bool,
     /// Decode output and the reference picture are separate images.
     pub dpb_and_output_distinct: bool,
-    /// Formats decode output images may have, and DPB images.
+    /// Formats decode output images may have.
     pub output_formats: Vec<vk::Format>,
+    /// Formats DPB (reference picture) images may have.
     pub dpb_formats: Vec<vk::Format>,
     /// The queue applies AV1 film grain itself.
     pub film_grain: bool,
@@ -59,18 +65,21 @@ impl Av1Decode {
     }
 }
 
-/// The first queue family that decodes AV1, from each family's flags and video codec
-/// operations.
+/// The first queue family other than `universal` that decodes AV1, from each family's flags and
+/// video codec operations.
 pub(crate) fn decode_family(
     families: &[(vk::QueueFlags, vk::VideoCodecOperationFlagsKHR)],
+    universal: u32,
 ) -> Option<u32> {
     families
         .iter()
-        .position(|(flags, operations)| {
-            flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR)
+        .enumerate()
+        .find(|&(index, (flags, operations))| {
+            index as u32 != universal
+                && flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR)
                 && operations.contains(vk::VideoCodecOperationFlagsKHR::DECODE_AV1)
         })
-        .map(|index| index as u32)
+        .map(|(index, _)| index as u32)
 }
 
 /// Each queue family's flags and video codec operations. Call only when the device reports
@@ -234,8 +243,18 @@ mod tests {
                     | vk::VideoCodecOperationFlagsKHR::DECODE_AV1,
             ),
         ];
-        assert_eq!(decode_family(&families), Some(3));
-        assert_eq!(decode_family(&families[..3]), None);
+        assert_eq!(decode_family(&families, 0), Some(3));
+        assert_eq!(decode_family(&families[..3], 0), None);
+    }
+
+    #[test]
+    fn the_universal_family_is_never_the_decode_family() {
+        let both =
+            vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE | vk::QueueFlags::VIDEO_DECODE_KHR;
+        let av1 = vk::VideoCodecOperationFlagsKHR::DECODE_AV1;
+        let families = [(both, av1), (vk::QueueFlags::VIDEO_DECODE_KHR, av1)];
+        assert_eq!(decode_family(&families, 0), Some(1));
+        assert_eq!(decode_family(&families[..1], 0), None);
     }
 
     #[test]
