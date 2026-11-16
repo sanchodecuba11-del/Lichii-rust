@@ -326,6 +326,7 @@ fn misaligned_exclusives_and_atomics_fault() {
         (0xc85f7c20u32, DATA + 4), // ldxr x0, [x1]
         (0xb8200022, DATA + 14),   // ldadd w0, w2, [x1], across a 16-byte block
         (0x48227c24, DATA + 8),    // casp x2, x3, x4, x5, [x1]
+        (0x08227c24, DATA + 4),    // casp w2, w3, w4, w5, [x1], within a 16-byte block
     ] {
         let mut h = harness(&[word]);
         h.ctx.x[1] = addr;

@@ -953,8 +953,13 @@ impl Exec<'_> {
                 let (o0, o1) = if size == 2 {
                     let expected = (e1 << 32) | (e0 & 0xffff_ffff);
                     let new = (n1 << 32) | (n0 & 0xffff_ffff);
+                    let addr = self.x(rn);
+                    if addr & 7 != 0 {
+                        // CASP keeps natural alignment even with FEAT_LSE2.
+                        return Err(self.fault(CpuFault::Alignment { pc: self.pc, addr }));
+                    }
                     // SAFETY: as for `AtomicRmw`.
-                    let old = self.atomic(self.x(rn), 2 << size, |ptr| unsafe {
+                    let old = self.atomic(addr, 2 << size, |ptr| unsafe {
                         atomic_cas(ptr, 3, expected, new)
                     })?;
                     (old & 0xffff_ffff, old >> 32)
@@ -1109,13 +1114,39 @@ pub(crate) fn atomic_alignment_ok(addr: u64, bytes: u64) -> bool {
 }
 
 /// An atomic update of the `bytes`-byte value at `ptr`, which is not naturally aligned but lies
-/// within one 16-byte aligned block: a compare-and-swap loop on that block. Returns the value
-/// before the update.
+/// within one 16-byte aligned block: a compare-and-swap loop on the smallest aligned block holding
+/// it (8 bytes when it fits in one, else 16). Returns the value before the update.
+///
+/// The block's host atomic overlaps the narrower ones other guest atomics on the same bytes use,
+/// which the Rust memory model leaves undefined. On x86-64 hosts (the JIT's only target) every
+/// locked read-modify-write (`lock cmpxchg` or `lock cmpxchg16b` here, `lock xadd` and the like
+/// for aligned guest atomics) is atomic with respect to every other one whatever their sizes,
+/// which is the guarantee LSE2 gives the guest.
 ///
 /// # Safety
-/// The 16-byte aligned block holding `ptr` must be valid; host and guest addresses agree modulo
-/// 16 (guest pages map to host pages).
+/// The aligned block holding `ptr` must be valid; host and guest addresses agree modulo 16
+/// (guest pages map to host pages).
 unsafe fn unaligned_update(ptr: *mut u8, bytes: u64, update: impl Fn(u64) -> u64) -> u64 {
+    let offset = ptr as usize & 7;
+    if offset as u64 + bytes <= 8 {
+        // SAFETY: the caller vouches for the block, which is 8-byte aligned.
+        let block = unsafe { AtomicU64::from_ptr(ptr.sub(offset).cast()) };
+        let mask = if bytes == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (bytes * 8)) - 1
+        };
+        let shift = offset * 8;
+        let mut current = block.load(Ordering::SeqCst);
+        loop {
+            let old = (current >> shift) & mask;
+            let next = (current & !(mask << shift)) | ((update(old) & mask) << shift);
+            match block.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return old,
+                Err(seen) => current = seen,
+            }
+        }
+    }
     let offset = ptr as usize & 15;
     // SAFETY: the caller vouches for the block.
     let block = unsafe { portable_atomic::AtomicU128::from_ptr(ptr.sub(offset).cast()) };
